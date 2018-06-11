@@ -2733,6 +2733,8 @@ class UnlockPassphraseForm(Form):
     )
 
     def __init__(self, *args, **kwargs):
+        self.volume = kwargs.pop('volume', None)
+
         super(UnlockPassphraseForm, self).__init__(*args, **kwargs)
         app = appPool.get_app('plugins')
         choices = [
@@ -2756,41 +2758,45 @@ class UnlockPassphraseForm(Form):
             self._errors['__all__'] = self.error_class([
                 _("You need either a passphrase or a recovery key to unlock")
             ])
+        elif self.volume:
+
+            if passphrase:
+                passfile = tempfile.mktemp(dir='/tmp/')
+                with open(passfile, 'w') as f:
+                    os.chmod(passfile, 600)
+                    f.write(passphrase)
+                failed = notifier().geli_attach(self.volume, passphrase=passfile)
+                os.unlink(passfile)
+            else:
+                keyfile = tempfile.mktemp(dir='/tmp/')
+                with open(keyfile, 'wb') as f:
+                    os.chmod(keyfile, 600)
+                    f.write(key.read())
+                failed = notifier().geli_attach(
+                    self.volume,
+                    passphrase=None,
+                    key=keyfile)
+                os.unlink(keyfile)
+
+            if failed > 0:
+                self._errors['__all__'] = self.error_class([
+                    _('%d Devices failed to decrypt. Please check your passphrase or key') % failed
+                ])
+
         return self.cleaned_data
 
-    def done(self, volume):
+    def done(self):
+
+        if not self.volume:
+            raise forms.ValidationError('No volume specified')
+
         passphrase = self.cleaned_data.get("passphrase")
-        key = self.cleaned_data.get("key")
-        if passphrase:
-            passfile = tempfile.mktemp(dir='/tmp/')
-            with open(passfile, 'w') as f:
-                os.chmod(passfile, 600)
-                f.write(passphrase)
-            failed = notifier().geli_attach(volume, passphrase=passfile)
-            os.unlink(passfile)
-        elif key is not None:
-            keyfile = tempfile.mktemp(dir='/tmp/')
-            with open(keyfile, 'wb') as f:
-                os.chmod(keyfile, 600)
-                f.write(key.read())
-            failed = notifier().geli_attach(
-                volume,
-                passphrase=None,
-                key=keyfile)
-            os.unlink(keyfile)
-        else:
-            raise ValueError("Need a passphrase or recovery key")
-        zimport = notifier().zfs_import(volume.vol_name, id=volume.vol_guid, first_time=False)
+
+        zimport = notifier().zfs_import(self.volume.vol_name, id=self.volume.vol_guid, first_time=False)
         if not zimport:
-            if failed > 0:
-                msg = _(
-                    "Volume could not be imported: %d devices failed to "
-                    "decrypt"
-                ) % failed
-            else:
-                msg = _("Volume could not be imported")
-            raise MiddlewareError(msg)
-        notifier().sync_encrypted(volume=volume)
+            raise MiddlewareError('Volume could not be imported')
+
+        notifier().sync_encrypted(volume=self.volume)
 
         _notifier = notifier()
         for svc in self.cleaned_data.get("services"):

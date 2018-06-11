@@ -1010,9 +1010,9 @@ def volume_unlock(request, object_id):
         return render(request, "storage/unlock.html")
 
     if request.method == "POST":
-        form = forms.UnlockPassphraseForm(request.POST, request.FILES)
+        form = forms.UnlockPassphraseForm(request.POST, request.FILES, volume=volume)
         if form.is_valid():
-            form.done(volume=volume)
+            form.done()
             return JsonResp(
                 request,
                 message=_("Volume unlocked"))

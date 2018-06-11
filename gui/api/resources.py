@@ -893,13 +893,14 @@ class VolumeResourceMixin(NestedMixin):
         )
         form = UnlockPassphraseForm(
             data=deserialized,
+            volume=obj
         )
         if not form.is_valid():
             raise ImmediateHttpResponse(
                 response=self.error_response(request, form.errors)
             )
         else:
-            form.done(obj)
+            form.done()
         return HttpResponse('Volume has been unlocked.', status=202)
 
     def lock(self, request, **kwargs):
