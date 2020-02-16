@@ -1,4 +1,4 @@
-from middlewared.alert.base import AlertService, format_alerts
+from middlewared.alert.base import AlertService
 from middlewared.schema import Dict, Str
 
 
@@ -7,7 +7,8 @@ class MailAlertService(AlertService):
 
     schema = Dict(
         "mail_attributes",
-        Str("email")
+        Str("email", default=""),
+        strict=True,
     )
 
     async def send(self, alerts, gone_alerts, new_alerts):
@@ -18,8 +19,11 @@ class MailAlertService(AlertService):
             self.logger.trace("E-Mail address for root not configured, not sending e-mail")
             return
 
+        text = await self._format_alerts(alerts, gone_alerts, new_alerts)
+
         await self.middleware.call("mail.send", {
             "subject": "Alerts",
-            "text": format_alerts(alerts, gone_alerts, new_alerts),
+            "text": text,
+            "html": text.replace("\n", "<br>"),
             "to": [email],
         })

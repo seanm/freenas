@@ -10,7 +10,7 @@ import time
 import traceback
 import threading
 
-from middlewared.service_exception import CallError
+from middlewared.service_exception import CallError, ValidationError, ValidationErrors, adapt_exception
 from middlewared.pipe import Pipes
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,8 @@ class JobsQueue(object):
 
         # Shared lock (JobSharedLock) dict
         self.job_locks = {}
+
+        self.middleware.event_register('core.get_jobs', 'Updates on job changes.')
 
     def __getitem__(self, item):
         return self.deque[item]
@@ -131,9 +133,8 @@ class JobsQueue(object):
         # waiting for the same lock
         self.queue_event.set()
 
-    async def __next__(self):
+    async def next(self):
         """
-        This is a blocking method.
         Returns when there is a new job ready to run.
         """
         while True:
@@ -141,7 +142,11 @@ class JobsQueue(object):
             await self.queue_event.wait()
             found = None
             for job in self.queue:
-                lock = self.get_lock(job)
+                try:
+                    lock = self.get_lock(job)
+                except Exception:
+                    logger.error('Failed to get lock for %r', job, exc_info=True)
+                    lock = None
                 # Get job in the queue if it has no lock or its not locked
                 if lock is None or not lock.locked():
                     found = job
@@ -161,7 +166,7 @@ class JobsQueue(object):
 
     async def run(self):
         while True:
-            job = await self.__next__()
+            job = await self.next()
             asyncio.ensure_future(job.run(self))
 
 
@@ -198,8 +203,9 @@ class JobsDeque(object):
         self.__dict[job.id] = job
 
     def remove(self, job_id):
-        self.__dict[job_id].cleanup()
-        del self.__dict[job_id]
+        if job_id in self.__dict:
+            self.__dict[job_id].cleanup()
+            del self.__dict[job_id]
 
 
 class Job(object):
@@ -207,7 +213,8 @@ class Job(object):
     Represents a long running call, methods marked with @job decorator
     """
 
-    def __init__(self, middleware, method_name, serviceobj, method, args, options, pipes):
+    def __init__(self, middleware, method_name, serviceobj, method, args, options, pipes,
+                 on_progress_cb=None):
         self._finished = asyncio.Event()
         self.middleware = middleware
         self.method_name = method_name
@@ -222,15 +229,18 @@ class Job(object):
         self.result = None
         self.error = None
         self.exception = None
+        self.exc_info = None
         self.state = State.WAITING
+        self.on_progress_cb = on_progress_cb
         self.progress = {
             'percent': None,
             'description': None,
             'extra': None,
         }
-        self.time_started = datetime.now()
+        self.internal_data = {}
+        self.time_started = datetime.utcnow()
         self.time_finished = None
-        self.loop = None
+        self.loop = asyncio.get_event_loop()
         self.future = None
 
         self.logs_path = None
@@ -267,6 +277,7 @@ class Job(object):
     def set_exception(self, exc_info):
         self.error = str(exc_info[1])
         self.exception = ''.join(traceback.format_exception(*exc_info))
+        self.exc_info = exc_info
 
     def set_state(self, state):
         if self.state == State.WAITING:
@@ -276,7 +287,7 @@ class Job(object):
         assert self.state not in (State.SUCCESS, State.FAILED, State.ABORTED)
         self.state = State.__members__[state]
         if self.state in (State.SUCCESS, State.FAILED, State.ABORTED):
-            self.time_finished = datetime.now()
+            self.time_finished = datetime.utcnow()
 
     def set_progress(self, percent, description=None, extra=None):
         if percent is not None:
@@ -286,7 +297,13 @@ class Job(object):
             self.progress['description'] = description
         if extra:
             self.progress['extra'] = extra
-        self.middleware.send_event('core.get_jobs', 'CHANGED', id=self.id, fields=self.__encode__())
+        encoded = self.__encode__()
+        if self.on_progress_cb:
+            try:
+                self.on_progress_cb(encoded)
+            except Exception:
+                logger.warn('Failed to run on progress callback', exc_info=True)
+        self.middleware.send_event('core.get_jobs', 'CHANGED', id=self.id, fields=encoded)
 
     async def wait(self, timeout=None):
         if timeout is None:
@@ -323,18 +340,26 @@ class Job(object):
             logs_dir = os.path.join("/tmp/middlewared/jobs")
             os.makedirs(logs_dir, exist_ok=True)
             self.logs_path = os.path.join(logs_dir, f"{self.id}.log")
-            self.logs_fd = open(self.logs_path, "wb")
+            self.logs_fd = open(self.logs_path, "wb", buffering=0)
 
         self.set_state('RUNNING')
         try:
-            self.loop = asyncio.get_event_loop()
             self.future = asyncio.ensure_future(self.__run_body())
-            await self.future
+            try:
+                await self.future
+            except Exception as e:
+                handled = adapt_exception(e)
+                if handled is not None:
+                    raise handled
+                else:
+                    raise
         except asyncio.CancelledError:
             self.set_state('ABORTED')
         except Exception:
             self.set_state('FAILED')
             self.set_exception(sys.exc_info())
+            if self.options['transient']:
+                logger.error("Transient job failed", exc_info=True)
         finally:
             await self.__close_logs()
             await self.__close_pipes()
@@ -353,7 +378,7 @@ class Job(object):
         and return the result as a json
         """
         if self.options.get('process'):
-            rv = await self.middleware._call_worker(self.serviceobj, self.method_name, *self.args, job={'id': self.id})
+            rv = await self.middleware._call_worker(self.method_name, *self.args, job={'id': self.id})
         else:
             # Make sure args are not altered during job run
             args = copy.deepcopy(self.args)
@@ -363,6 +388,8 @@ class Job(object):
                 rv = await self.middleware.run_in_thread(self.method, *([self] + args))
         self.set_result(rv)
         self.set_state('SUCCESS')
+        if self.progress['percent'] != 100:
+            self.set_progress(100, '')
 
     async def __close_logs(self):
         if self.logs_fd:
@@ -374,22 +401,22 @@ class Job(object):
                 lines = 0
                 with open(self.logs_path, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
-                        if len(head) < 5:
+                        if len(head) < 10:
                             head.append(line)
-
-                        tail.append(line)
-                        tail = tail[-5:]
+                        else:
+                            tail.append(line)
+                            tail = tail[-10:]
 
                         lines += 1
 
-                if lines > 10:
-                    excerpt = "%s[%d more lines]\n%s" % ("".join(head), lines - 10, "".join(tail))
+                if lines > 20:
+                    excerpt = "%s... %d more lines ...\n%s" % ("".join(head), lines - 20, "".join(tail))
                 else:
                     excerpt = "".join(head + tail)
 
                 return excerpt
 
-            self.logs_excerpt = await self.middleware.run_in_io_thread(get_logs_excerpt)
+            self.logs_excerpt = await self.middleware.run_in_thread(get_logs_excerpt)
 
     async def __close_pipes(self):
         def close_pipes():
@@ -398,9 +425,29 @@ class Job(object):
             if self.pipes.output:
                 self.pipes.output.w.close()
 
-        await self.middleware.run_in_io_thread(close_pipes)
+        await self.middleware.run_in_thread(close_pipes)
 
     def __encode__(self):
+        exc_info = None
+        if self.exc_info:
+            etype = self.exc_info[0]
+            evalue = self.exc_info[1]
+            if isinstance(evalue, ValidationError):
+                extra = [(evalue.attribute, evalue.errmsg, evalue.errno)]
+                etype = 'VALIDATION'
+            elif isinstance(evalue, ValidationErrors):
+                extra = list(evalue)
+                etype = 'VALIDATION'
+            elif isinstance(evalue, CallError):
+                etype = etype.__name__
+                extra = evalue.extra
+            else:
+                etype = etype.__name__
+                extra = None
+            exc_info = {
+                'type': etype,
+                'extra': extra,
+            }
         return {
             'id': self.id,
             'method': self.method_name,
@@ -411,6 +458,7 @@ class Job(object):
             'result': self.result,
             'error': self.error,
             'exception': self.exception,
+            'exc_info': exc_info,
             'state': self.state.name,
             'time_started': self.time_started,
             'time_finished': self.time_finished,

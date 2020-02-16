@@ -4,19 +4,24 @@ from .utils import ProgressBar
 from collections import defaultdict, namedtuple, Callable
 from threading import Event as TEvent, Lock, Thread
 from ws4py.client.threadedclient import WebSocketClient
-from ws4py.websocket import WebSocket
 
 import argparse
-from base64 import b64encode
-import ctypes
+from base64 import b64decode
 import errno
 import os
+import pickle
+import pprint
 import socket
-import ssl
 import sys
-import threading
 import time
 import uuid
+
+try:
+    from libzfs import Error as ZFSError
+except ImportError:
+    LIBZFS = False
+else:
+    LIBZFS = True
 
 
 class Event(TEvent):
@@ -47,119 +52,60 @@ class Event(TEvent):
 CALL_TIMEOUT = int(os.environ.get('CALL_TIMEOUT', 60))
 
 
+class ReserveFDException(Exception):
+    pass
+
+
 class WSClient(WebSocketClient):
     def __init__(self, url, *args, **kwargs):
         self.client = kwargs.pop('client')
-        reserved_ports = kwargs.pop('reserved_ports')
-        reserved_ports_blacklist = kwargs.pop('reserved_ports_blacklist')
-        self.reserved_fd = None
+        self.reserved_ports = kwargs.pop('reserved_ports', False)
+        self.reserved_ports_blacklist = kwargs.pop('reserved_ports_blacklist', None)
         self.protocol = DDPProtocol(self)
-        if not reserved_ports:
-            super(WSClient, self).__init__(url, *args, **kwargs)
-        else:
-            """
-            All this code has been copied from WebSocketClient.__init__
-            because it is not prepared to handle a custom socket via method
-            overriding. We need to use socket.fromfd in case reserved_ports
-            is specified.
-            """
-            self.url = url
-            self.host = None
-            self.scheme = None
-            self.port = None
-            self.unix_socket_path = None
-            self.resource = None
-            self.ssl_options = kwargs.get('ssl_options') or {}
-            self.extra_headers = kwargs.get('headers') or []
-            self.exclude_headers = kwargs.get('exclude_headers') or []
-            self.exclude_headers = [x.lower() for x in self.exclude_headers]
+        super(WSClient, self).__init__(url, *args, **kwargs)
 
-            if self.scheme == "wss":
-                # Prevent check_hostname requires server_hostname (ref #187)
-                if "cert_reqs" not in self.ssl_options:
-                    self.ssl_options["cert_reqs"] = ssl.CERT_NONE
+    def get_reserved_portfd(self):
+        if self.reserved_ports_blacklist is None:
+            self.reserved_ports_blacklist = []
 
-            self._parse_url()
+        # defined in net/in.h
+        IP_PORTRANGE = 19
+        IP_PORTRANGE_LOW = 2
 
-            if self.unix_socket_path:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
-            else:
-                # Let's handle IPv4 and IPv6 addresses
-                # Simplified from CherryPy's code
-                try:
-                    family, socktype, proto, canonname, sa = socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)[0]
-                except socket.gaierror:
-                    family = socket.AF_INET
-                    if self.host.startswith('::'):
-                        family = socket.AF_INET6
+        oldsock = None
 
-                    socktype = socket.SOCK_STREAM
-                    proto = 0
+        n_retries = 5
+        for retry in range(n_retries):
+            self.sock.setsockopt(socket.IPPROTO_IP, IP_PORTRANGE, IP_PORTRANGE_LOW)
 
-                """
-                This is the line replaced to use socket.fromfd
-                """
-                try:
-                    self.reserved_fd = self.get_reserved_portfd(blacklist=reserved_ports_blacklist)
-                    sock = socket.fromfd(self.reserved_fd, family, socktype, proto)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    if hasattr(socket, 'AF_INET6') and family == socket.AF_INET6 and self.host.startswith('::'):
-                        try:
-                            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-                        except (AttributeError, socket.error):
-                            pass
-                except Exception as e:
-                    if self.reserved_fd:
-                        try:
-                            os.close(self.reserved_fd)
-                        except OSError:
-                            pass
-                    raise e
-
-            WebSocket.__init__(self, sock, protocols=kwargs.get('protocols'),
-                               extensions=kwargs.get('extensions'),
-                               heartbeat_freq=kwargs.get('heartbeat_freq'))
-
-            self.stream.always_mask = True
-            self.stream.expect_masking = False
-            self.key = b64encode(os.urandom(16))
-            self._th = threading.Thread(target=self.run, name='WebSocketClient')
-            self._th.daemon = True
-
-    def get_reserved_portfd(self, blacklist=None):
-        """
-        Get a file descriptor with a reserved port (<=1024).
-        The port is arbitrary using the libc "rresvport" call and its tried
-        again if its within `blacklist` list.
-        """
-        if blacklist is None:
-            blacklist = []
-
-        libc = ctypes.cdll.LoadLibrary('libc.so.7')
-        port = ctypes.c_int(0)
-        pport = ctypes.pointer(port)
-        fd = libc.rresvport(pport)
-        retries = 5
-        while True:
-            if retries == 0:
-                break
-            if fd < 0:
+            try:
+                self.sock.bind(('', 0))
+            except OSError:
                 time.sleep(0.1)
-                fd = libc.rresvport(pport)
-                retries -= 1
                 continue
-            if pport.contents.value in blacklist:
-                oldfd = fd
-                fd = libc.rresvport(pport)
-                os.close(oldfd)
-                retries -= 1
-                continue
-            else:
+
+            # The old socket can't be closed before we bind the new socket or
+            # we have the possibility of binding to the same port.
+            if retry > 0:
+                oldsock.close()
+
+            _host, port = self.sock.gethostname()
+            if port not in self.reserved_ports_blacklist:
+                return
+
+            # If we're at last pass in loop and get here, break out
+            # so we don't set up a socket just to close it essentially
+            # making it a NO-OP.
+            if retry == n_retries - 1:
                 break
-        if fd < 0:
-            raise ValueError('Failed to reserv a privileged port')
-        return fd
+
+            oldsock = self.sock
+
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        raise ReserveFDException()
 
     def connect(self):
         self.sock.settimeout(10)
@@ -228,14 +174,52 @@ class Call(object):
         self.trace = None
         self.type = None
         self.extra = None
+        self.py_exception = None
+
+
+class Job(object):
+
+    def __init__(self, client, job_id, callback=None):
+        self.client = client
+        self.job_id = job_id
+        # If a job event has been received already then we must set an Event
+        # to wait for this job to finish.
+        # Otherwise we create a new stub for the job with the Event for when
+        # the job event arrives to use existing event.
+        with client._jobs_lock:
+            job = client._jobs.get(job_id)
+            self.event = None
+            if job:
+                self.event = job.get('__ready')
+            if self.event is None:
+                self.event = job['__ready'] = Event()
+            job['__callback'] = callback
+
+    def __repr__(self):
+        return f'<Job[{self.job_id}]>'
+
+    def result(self):
+        # Wait indefinitely for the job event with state SUCCESS/FAILED/ABORTED
+        self.event.wait()
+        job = self.client._jobs.pop(self.job_id, None)
+        if job is None:
+            raise ClientException('No job event was received.')
+        if job['state'] != 'SUCCESS':
+            if job['exc_info'] and job['exc_info']['type'] == 'VALIDATION':
+                raise ValidationErrors(job['exc_info']['extra'])
+            raise ClientException(job['error'], trace={'formatted': job['exception']}, extra=job['exc_info']['extra'])
+        return job['result']
 
 
 class ErrnoMixin:
     ENOMETHOD = 201
     ESERVICESTARTFAILURE = 202
+    EALERTCHECKERUNAVAILABLE = 203
 
     @classmethod
     def _get_errname(cls, code):
+        if LIBZFS and 2000 <= code <= 2100:
+            return 'EZFS_' + ZFSError(code).name
         for k, v in cls.__dict__.items():
             if k.startswith("E") and v == code:
                 return k
@@ -278,7 +262,10 @@ class CallTimeout(ClientException):
 
 class Client(object):
 
-    def __init__(self, uri=None, reserved_ports=False, reserved_ports_blacklist=None):
+    def __init__(
+        self, uri=None, reserved_ports=False, reserved_ports_blacklist=None,
+        py_exceptions=False,
+    ):
         """
         Arguments:
            :reserved_ports(bool): whether the connection should origin using a reserved port (<= 1024)
@@ -289,6 +276,7 @@ class Client(object):
         self._jobs_lock = Lock()
         self._jobs_watching = False
         self._pings = {}
+        self._py_exceptions = py_exceptions
         self._event_callbacks = {}
         if uri is None:
             uri = 'ws+unix:///var/run/middlewared.sock'
@@ -307,10 +295,10 @@ class Client(object):
             self._connected.wait(10)
             if not self._connected.is_set():
                 raise ClientException('Failed connection handshake')
-        except Exception as e:
+        except Exception:
             if hasattr(self, '_ws'):
                 del self._ws
-            raise e
+            raise
 
     def __enter__(self):
         return self
@@ -344,6 +332,11 @@ class Client(object):
                     call.trace = message['error'].get('trace')
                     call.type = message['error'].get('type')
                     call.extra = message['error'].get('extra')
+                    call.py_exception = message['error'].get('py_exception')
+                    if self._py_exceptions and call.py_exception:
+                        call.py_exception = pickle.loads(b64decode(
+                            call.py_exception
+                        ))
                 call.returned.set()
                 self._unregister_call(call)
         elif msg in ('added', 'changed', 'removed'):
@@ -363,12 +356,22 @@ class Client(object):
                     if subid == event['id']:
                         event['ready'].set()
                         break
+        elif msg == 'nosub':
+            for event in self._event_callbacks.values():
+                if message['id'] == event['id']:
+                    event['error'] = message['error']['error']
+                    event['ready'].set()
+                    break
 
     def on_open(self):
+        features = []
+        if self._py_exceptions:
+            features.append('PY_EXCEPTIONS')
         self._send({
             'msg': 'connect',
             'version': '1',
             'support': ['1'],
+            'features': features,
         })
 
     def on_close(self, code, reason=None):
@@ -393,14 +396,14 @@ class Client(object):
                 if isinstance(job.get('__callback'), Callable):
                     job['__callback'](job)
                 if mtype == 'CHANGED' and job['state'] in ('SUCCESS', 'FAILED', 'ABORTED'):
-                        # If an Event already exist we just set it to mark it finished.
-                        # Otherwise we create a new Event.
-                        # This is to prevent a race-condition of job finishing before
-                        # the client can create the Event.
-                        event = job.get('__ready')
-                        if event is None:
-                            event = job['__ready'] = Event()
-                        event.set()
+                    # If an Event already exist we just set it to mark it finished.
+                    # Otherwise we create a new Event.
+                    # This is to prevent a race-condition of job finishing before
+                    # the client can create the Event.
+                    event = job.get('__ready')
+                    if event is None:
+                        event = job['__ready'] = Event()
+                    event.set()
 
     def _jobs_subscribe(self):
         """
@@ -431,33 +434,17 @@ class Client(object):
             raise CallTimeout("Call timeout")
 
         if c.errno:
+            if c.py_exception:
+                raise c.py_exception
             if c.trace and c.type == 'VALIDATION':
                 raise ValidationErrors(c.extra)
             raise ClientException(c.error, c.errno, c.trace, c.extra)
 
         if job:
-            job_id = c.result
-            # If a job event has been received already then we must set an Event
-            # to wait for this job to finish.
-            # Otherwise we create a new stub for the job with the Event for when
-            # the job event arrives to use existing event.
-            with self._jobs_lock:
-                job = self._jobs.get(job_id)
-                event = None
-                if job:
-                    event = job.get('__ready')
-                if event is None:
-                    event = job['__ready'] = Event()
-                job['__callback'] = kwargs.pop('callback', None)
-
-            # Wait indefinitely for the job event with state SUCCESS/FAILED/ABORTED
-            event.wait()
-            job = self._jobs.pop(job_id, None)
-            if job is None:
-                raise ClientException('No job event was received.')
-            if job['state'] != 'SUCCESS':
-                raise ClientException(job['error'], trace=job['exception'])
-            return job['result']
+            jobobj = Job(self, c.result, callback=kwargs.get('callback'))
+            if job == 'RETURN':
+                return jobobj
+            return jobobj.result()
 
         return c.result
 
@@ -468,6 +455,7 @@ class Client(object):
             'id': _id,
             'callback': callback,
             'ready': ready,
+            'error': None,
         }
         self._send({
             'msg': 'sub',
@@ -475,6 +463,18 @@ class Client(object):
             'name': name,
         })
         ready.wait()
+        if self._event_callbacks[name]['error']:
+            raise ValueError(self._event_callbacks[name]['error'])
+        return _id
+
+    def unsubscribe(self, id):
+        self._send({
+            'msg': 'unsub',
+            'id': id,
+        })
+        for k, v in list(self._event_callbacks.items()):
+            if v['id'] == id:
+                self._event_callbacks.pop(k)
 
     def ping(self, timeout=10):
         _id = str(uuid.uuid4())
@@ -505,7 +505,13 @@ def main():
     subparsers = parser.add_subparsers(help='sub-command help', dest='name')
     iparser = subparsers.add_parser('call', help='Call method')
     iparser.add_argument(
-        '-j', '--job', help='Call a long running job with progress bars', type=bool, default=False
+        '-j', '--job', help='Call a long running job', type=bool, default=False
+    )
+    iparser.add_argument(
+        '-jp', '--job-print',
+        help='Method to print job progress', type=str, choices=(
+            'progressbar', 'description',
+        ), default='progressbar',
     )
     iparser.add_argument('method', nargs='+')
 
@@ -530,42 +536,64 @@ def main():
                 yield i
 
     if args.name == 'call':
-        with Client(uri=args.uri) as c:
-            try:
-                if args.username and args.password:
-                    if not c.call('auth.login', args.username, args.password):
-                        raise ValueError('Invalid username or password')
-            except Exception as e:
-                print("Failed to login: ", e)
-                sys.exit(0)
-            try:
-                kwargs = {}
-                if args.timeout:
-                    kwargs['timeout'] = args.timeout
-                if args.job:
-                    # display the job progress and status message while we wait
-                    with ProgressBar() as progress_bar:
-                        kwargs.update({
-                            'job': True,
-                            'callback': lambda job: progress_bar.update(
-                                job['progress']['percent'], job['progress']['description']
-                            )
-                        })
+        try:
+            with Client(uri=args.uri) as c:
+                try:
+                    if args.username and args.password:
+                        if not c.call('auth.login', args.username, args.password):
+                            raise ValueError('Invalid username or password')
+                except Exception as e:
+                    print("Failed to login: ", e)
+                    sys.exit(0)
+                try:
+                    kwargs = {}
+                    if args.timeout:
+                        kwargs['timeout'] = args.timeout
+                    if args.job:
+                        if args.job_print == 'progressbar':
+                            # display the job progress and status message while we wait
+                            with ProgressBar() as progress_bar:
+                                kwargs.update({
+                                    'job': True,
+                                    'callback': lambda job: progress_bar.update(
+                                        job['progress']['percent'], job['progress']['description']
+                                    )
+                                })
+                                rv = c.call(args.method[0], *list(from_json(args.method[1:])), **kwargs)
+                                progress_bar.finish()
+                        else:
+                            lastdesc = ''
+
+                            def callback(job):
+                                nonlocal lastdesc
+                                desc = job['progress']['description']
+                                if desc is not None and desc != lastdesc:
+                                    print(desc, file=sys.stderr)
+                                lastdesc = desc
+
+                            kwargs.update({
+                                'job': True,
+                                'callback': callback,
+                            })
+                            rv = c.call(args.method[0], *list(from_json(args.method[1:])), **kwargs)
+                    else:
                         rv = c.call(args.method[0], *list(from_json(args.method[1:])), **kwargs)
-                        progress_bar.finish()
-                else:
-                    rv = c.call(args.method[0], *list(from_json(args.method[1:])), **kwargs)
-                if isinstance(rv, (int, str)):
-                    print(rv)
-                else:
-                    print(json.dumps(rv))
-            except ClientException as e:
-                if not args.quiet:
-                    if e.error:
-                        print(e.error, file=sys.stderr)
-                    if e.trace:
-                        print(e.trace['formatted'], file=sys.stderr)
-                sys.exit(1)
+                    if isinstance(rv, (int, str)):
+                        print(rv)
+                    else:
+                        print(json.dumps(rv))
+                except ClientException as e:
+                    if not args.quiet:
+                        if e.error:
+                            print(e.error, file=sys.stderr)
+                        if e.trace:
+                            print(e.trace['formatted'], file=sys.stderr)
+                        if e.extra:
+                            pprint.pprint(e.extra, stream=sys.stderr)
+                    sys.exit(1)
+        except (FileNotFoundError, ConnectionRefusedError):
+            print('Failed to run middleware call. Daemon not running?', file=sys.stderr)
+            sys.exit(1)
     elif args.name == 'ping':
         with Client(uri=args.uri) as c:
             if not c.ping():
@@ -597,8 +625,10 @@ def main():
             number = 0
 
             def cb(mtype, **message):
+                nonlocal number
                 print(json.dumps(message))
-                if args.number and args.number >= number:
+                number += 1
+                if args.number and number >= args.number:
                     event.set()
 
             c.subscribe(args.event, cb)
@@ -623,14 +653,32 @@ def main():
                     time.sleep(0.2)
                     continue
 
-        thread = Thread(target=waitready, args=[args])
-        thread.daemon = True
-        thread.start()
-        thread.join(args.timeout)
-        if thread.is_alive():
-            sys.exit(1)
-        else:
-            sys.exit(0)
+        seq = -1
+        state_time = time.monotonic()
+        while True:
+            if args.timeout is not None and time.monotonic() - state_time > args.timeout:
+                print(f'Middleware startup is idle for more than {args.timeout} seconds')
+                sys.exit(1)
+
+            thread = Thread(target=waitready, args=[args])
+            thread.daemon = True
+            thread.start()
+            thread.join(args.timeout)
+            if not thread.is_alive():
+                sys.exit(0)
+
+            try:
+                with open('/var/run/middlewared_startup.seq') as f:
+                    new_seq = int(f.read())
+                    if new_seq < seq:
+                        print('Middleware has restarted')
+                        sys.exit(1)
+
+                    if new_seq != seq:
+                        seq = new_seq
+                        state_time = time.monotonic()
+            except IOError:
+                pass
 
 
 if __name__ == '__main__':

@@ -1,12 +1,16 @@
-from middlewared.alert.base import Alert, AlertLevel, AlertSource
+from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, AlertSource
 
 
-class VolumeStatusAlertSource(AlertSource):
+class VolumeStatusAlertClass(AlertClass):
+    category = AlertCategory.STORAGE
     level = AlertLevel.CRITICAL
-    title = "The volume status is not HEALTHY"
+    title = "Pool Status Is Not Healthy"
+    text = "Pool %(volume)s state is %(state)s: %(status)s."
 
     hardware = True
 
+
+class VolumeStatusAlertSource(AlertSource):
     async def check(self):
         if not await self.enabled():
             return
@@ -16,20 +20,19 @@ class VolumeStatusAlertSource(AlertSource):
             if not pool["is_decrypted"]:
                 continue
 
-            state, status = await self.middleware.call("notifier.zpool_status", pool["name"])
-            if state != "HEALTHY":
+            if not pool['healthy']:
                 if not (await self.middleware.call("system.is_freenas")):
                     try:
-                        await self.middleware.call("notifier.zpool_enclosure_sync", pool["name"])
+                        await self.middleware.call("enclosure.sync_zpool", pool["name"])
                     except Exception:
                         pass
 
                 alerts.append(Alert(
-                    "The volume %(volume)s state is %(state)s: %(status)s",
+                    VolumeStatusAlertClass,
                     {
                         "volume": pool["name"],
-                        "state": state,
-                        "status": status,
+                        "state": pool["status"],
+                        "status": pool["status_detail"],
                     }
                 ))
 
@@ -37,7 +40,7 @@ class VolumeStatusAlertSource(AlertSource):
 
     async def enabled(self):
         if not (await self.middleware.call("system.is_freenas")):
-            status = await self.middleware.call("notifier.failover_status")
+            status = await self.middleware.call("failover.status")
             return status in ("MASTER", "SINGLE")
 
         return True

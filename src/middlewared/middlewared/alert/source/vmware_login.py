@@ -2,15 +2,30 @@ import pickle as pickle
 
 from lockfile import LockFile
 
-from middlewared.alert.base import Alert, AlertLevel, ThreadedAlertSource
+from middlewared.alert.base import AlertClass, OneShotAlertClass, AlertCategory, AlertLevel, Alert, ThreadedAlertSource
 
 VMWARELOGIN_FAILS = "/var/tmp/.vmwarelogin_fails"
 
 
-class VMWareLoginFailedAlertSource(ThreadedAlertSource):
+class VMWareLoginFailedAlertClass(AlertClass, OneShotAlertClass):
+    category = AlertCategory.TASKS
     level = AlertLevel.WARNING
-    title = "VMWare failed to log in to snapshot"
+    title = "VMWare Login Failed"
+    text = "VMWare login to %(hostname)s failed: %(error)s."
 
+    async def create(self, args):
+        return Alert(VMWareLoginFailedAlertClass, args)
+
+    async def delete(self, alerts, query):
+        hostname = query
+
+        return list(filter(
+            lambda alert: alert.args["hostname"] != hostname,
+            alerts
+        ))
+
+
+class LegacyVMWareLoginFailedAlertSource(ThreadedAlertSource):
     def check_sync(self):
         try:
             with LockFile(VMWARELOGIN_FAILS):
@@ -27,12 +42,9 @@ class VMWareLoginFailedAlertSource(ThreadedAlertSource):
             except IndexError:
                 continue
 
-            alerts.append(Alert(
-                "VMWare %(vmware)s failed to login to snapshot: %(err)s",
-                {
-                    "vmware": vmware,
-                    "err": errmsg,
-                }
-            ))
+            alerts.append(Alert(VMWareLoginFailedAlertClass, {
+                "hostname": vmware["hostname"],
+                "error": errmsg,
+            }))
 
         return alerts

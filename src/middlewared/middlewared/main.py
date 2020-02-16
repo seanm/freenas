@@ -1,13 +1,20 @@
 from .apidocs import app as apidocs_app
 from .client import ejson as json
-from .event import EventSource
+from .event import EventSource, Events
 from .job import Job, JobsQueue
 from .pipe import Pipes, Pipe
 from .restful import RESTfulAPI
-from .schema import ResolverError, Error as SchemaError
-from .service import CallError, CallException, ValidationError, ValidationErrors
-from .utils import start_daemon_thread, load_modules, load_classes
-from .worker import ProcessPoolExecutor, main_worker
+from .schema import Error as SchemaError
+from .service_exception import adapt_exception, CallError, CallException, ValidationError, ValidationErrors
+from .utils import start_daemon_thread, LoadPluginsMixin
+from .utils.debug import get_frame_details, get_threads_stacks
+from .utils.lock import SoftHardSemaphore, SoftHardSemaphoreLimit
+from .utils.io_thread_pool_executor import IoThreadPoolExecutor
+import middlewared.utils.osc as osc
+from .utils.profile import profile_wrap
+from .utils.run_in_thread import RunInThreadMixin
+from .webui_auth import WebUIAuth
+from .worker import main_worker, worker_init
 from aiohttp import web
 from aiohttp.web_exceptions import HTTPPermanentRedirect
 from aiohttp.web_middlewares import normalize_path_middleware
@@ -17,24 +24,37 @@ from collections import defaultdict
 import argparse
 import asyncio
 import binascii
+from collections import namedtuple
 import concurrent.futures
+import concurrent.futures.process
+import concurrent.futures.thread
 import errno
+import fcntl
 import functools
 import inspect
-import linecache
+import itertools
 import multiprocessing
 import os
+import pickle
+import platform
+import re
 import queue
 import select
 import setproctitle
 import signal
+import struct
 import sys
+import termios
 import threading
 import time
 import traceback
 import types
 import urllib.parse
 import uuid
+
+if platform.system() == "Linux":
+    from systemd.daemon import notify as systemd_notify
+
 from . import logger
 
 
@@ -48,7 +68,13 @@ class Application(object):
         self.authenticated = False
         self.handshake = False
         self.logger = logger.Logger('application').getLogger()
-        self.sessionid = str(uuid.uuid4())
+        self.session_id = str(uuid.uuid4())
+        self.rest = False
+        self.websocket = True
+
+        # Allow at most 10 concurrent calls and only queue up until 20
+        self._softhardsemaphore = SoftHardSemaphore(10, 20)
+        self._py_exceptions = False
 
         """
         Callback index registered by services. They are blocking.
@@ -66,9 +92,7 @@ class Application(object):
         self.__callbacks[name].append(method)
 
     def _send(self, data):
-        asyncio.run_coroutine_threadsafe(self.response.send_json(
-            data, dumps=json.dumps
-        ), loop=self.loop)
+        asyncio.run_coroutine_threadsafe(self.response.send_str(json.dumps(data)), loop=self.loop)
 
     def _tb_error(self, exc_info):
         klass, exc, trace = exc_info
@@ -79,55 +103,9 @@ class Application(object):
             tb_frame = cur_tb.tb_frame
             cur_tb = cur_tb.tb_next
 
-            if not isinstance(tb_frame, types.FrameType):
-                continue
-
-            cur_frame = {
-                'filename': tb_frame.f_code.co_filename,
-                'lineno': tb_frame.f_lineno,
-                'method': tb_frame.f_code.co_name,
-                'line': linecache.getline(tb_frame.f_code.co_filename, tb_frame.f_lineno),
-            }
-
-            argspec = None
-            varargspec = None
-            keywordspec = None
-            _locals = {}
-
-            try:
-                arginfo = inspect.getargvalues(tb_frame)
-                argspec = arginfo.args
-                if arginfo.varargs is not None:
-                    varargspec = arginfo.varargs
-                    temp_varargs = list(arginfo.locals[varargspec])
-                    for i, arg in enumerate(temp_varargs):
-                        temp_varargs[i] = '***'
-
-                    arginfo.locals[varargspec] = tuple(temp_varargs)
-
-                if arginfo.keywords is not None:
-                    keywordspec = arginfo.keywords
-
-                _locals.update(list(arginfo.locals.items()))
-
-            except Exception:
-                self.logger.critical('Error while extracting arguments from frames.', exc_info=True)
-
-            if argspec:
-                cur_frame['argspec'] = argspec
-            if varargspec:
-                cur_frame['varargspec'] = varargspec
-            if keywordspec:
-                cur_frame['keywordspec'] = keywordspec
-            if _locals:
-                try:
-                    cur_frame['locals'] = {k: repr(v) for k, v in _locals.items()}
-                except Exception:
-                    # repr() may fail since it may be one of the reasons
-                    # of the exception
-                    cur_frame['locals'] = {}
-
-            frames.append(cur_frame)
+            cur_frame = get_frame_details(tb_frame, self.logger)
+            if cur_frame:
+                frames.append(cur_frame)
 
         return {
             'class': klass.__name__,
@@ -136,22 +114,28 @@ class Application(object):
         }
 
     def send_error(self, message, errno, reason=None, exc_info=None, etype=None, extra=None):
+        error_extra = {}
+        if self._py_exceptions and exc_info:
+            error_extra['py_exception'] = binascii.b2a_base64(pickle.dumps(exc_info[1])).decode()
         self._send({
             'msg': 'result',
             'id': message['id'],
-            'error': {
+            'error': dict({
                 'error': errno,
                 'type': etype,
                 'reason': reason,
                 'trace': self._tb_error(exc_info) if exc_info else None,
                 'extra': extra,
-            },
+            }, **error_extra),
         })
 
-    async def call_method(self, message):
+    async def call_method(self, message, serviceobj, methodobj):
+        params = message.get('params') or []
 
         try:
-            result = await self.middleware.call_method(self, message)
+            async with self._softhardsemaphore:
+                result = await self.middleware._call(message['method'], serviceobj, methodobj, params, app=self,
+                                                     io_thread=False)
             if isinstance(result, Job):
                 result = result.id
             elif isinstance(result, types.GeneratorType):
@@ -163,6 +147,12 @@ class Application(object):
                 'msg': 'result',
                 'result': result,
             })
+        except SoftHardSemaphoreLimit as e:
+            self.send_error(
+                message,
+                errno.ETOOMANYREFS,
+                f'Maximum number of concurrent calls ({e.args[0]}) has exceeded.',
+            )
         except ValidationError as e:
             self.send_error(message, e.errno, str(e), sys.exc_info(), etype='VALIDATION', extra=[
                 (e.attribute, e.errmsg, e.errno),
@@ -172,21 +162,33 @@ class Application(object):
         except (CallException, SchemaError) as e:
             # CallException and subclasses are the way to gracefully
             # send errors to the client
-            self.send_error(message, e.errno, str(e), sys.exc_info())
+            self.send_error(message, e.errno, str(e), sys.exc_info(), extra=e.extra)
         except Exception as e:
-            self.send_error(message, errno.EINVAL, str(e), sys.exc_info())
-            self.logger.warn('Exception while calling {}(*{})'.format(
-                message['method'],
-                self.middleware.dump_args(message.get('params', []), method_name=message['method'])
-            ), exc_info=True)
-
-            if self.middleware.crash_reporting.is_disabled():
-                self.logger.debug('[Crash Reporting] is disabled using sentinel file.')
+            adapted = adapt_exception(e)
+            if adapted:
+                self.send_error(message, adapted.errno, str(adapted), sys.exc_info(), extra=adapted.extra)
             else:
+                self.send_error(message, errno.EINVAL, str(e), sys.exc_info())
+                if not self._py_exceptions:
+                    self.logger.warn('Exception while calling {}(*{})'.format(
+                        message['method'],
+                        self.middleware.dump_args(message.get('params', []), method_name=message['method'])
+                    ), exc_info=True)
+                    asyncio.ensure_future(self.__crash_reporting(sys.exc_info()))
+
+    async def __crash_reporting(self, exc_info):
+        if self.middleware.crash_reporting.is_disabled():
+            self.logger.debug('[Crash Reporting] is disabled using sentinel file.')
+        elif self.middleware.crash_reporting_semaphore.locked():
+            self.logger.debug('[Crash Reporting] skipped due too many running instances')
+        else:
+            async with self.middleware.crash_reporting_semaphore:
                 extra_log_files = (('/var/log/middlewared.log', 'middlewared_log'),)
-                asyncio.ensure_future(self.middleware.run_in_thread(
-                    self.middleware.crash_reporting.report, sys.exc_info(), None, extra_log_files
-                ))
+                await self.middleware.run_in_thread(
+                    self.middleware.crash_reporting.report,
+                    exc_info,
+                    extra_log_files,
+                )
 
     async def subscribe(self, ident, name):
 
@@ -229,6 +231,7 @@ class Application(object):
         elif ident in self.__event_sources:
             event_source = self.__event_sources[ident]['event_source']
             await self.middleware.run_in_thread(event_source.cancel)
+            self.__event_sources.pop(ident)
 
     def send_event(self, name, event_type, **kwargs):
         if (
@@ -285,13 +288,16 @@ class Application(object):
                     'version': '1',
                 })
             else:
+                features = message.get('features') or []
+                if 'PY_EXCEPTIONS' in features:
+                    self._py_exceptions = True
                 # aiohttp can cancel tasks if a request take too long to finish
                 # It is desired to prevent that in this stage in case we are debugging
                 # middlewared via gdb (which makes the program execution a lot slower)
                 await asyncio.shield(self.middleware.call_hook('core.on_connect', app=self))
                 self._send({
                     'msg': 'connected',
-                    'session': self.sessionid,
+                    'session': self.session_id,
                 })
                 self.handshake = True
             return
@@ -304,7 +310,17 @@ class Application(object):
             return
 
         if message['msg'] == 'method':
-            asyncio.ensure_future(self.call_method(message))
+            try:
+                serviceobj, methodobj = self.middleware._method_lookup(message['method'])
+            except CallError as e:
+                self.send_error(message, e.errno, str(e), sys.exc_info(), extra=e.extra)
+                return
+
+            if not self.authenticated and not hasattr(methodobj, '_no_auth_required'):
+                self.send_error(message, errno.EACCES, 'Not authenticated')
+                return
+
+            asyncio.ensure_future(self.call_method(message, serviceobj, methodobj))
             return
         elif message['msg'] == 'ping':
             pong = {'msg': 'pong'}
@@ -334,7 +350,14 @@ class FileApplication(object):
         self.jobs[job_id] = self.middleware.loop.call_later(
             60, lambda: asyncio.ensure_future(self._cleanup_job(job_id)))
 
+    async def _cleanup_cancel(self, job_id):
+        job_cleanup = self.jobs.pop(job_id, None)
+        if job_cleanup:
+            job_cleanup.cancel()
+
     async def _cleanup_job(self, job_id):
+        if job_id not in self.jobs:
+            return
         self.jobs[job_id].cancel()
         del self.jobs[job_id]
 
@@ -361,7 +384,7 @@ class FileApplication(object):
             if not token:
                 denied = True
             else:
-                if (token['attributes'] or {}).get('job') != job_id:
+                if token['attributes'].get('job') != job_id:
                     denied = True
                 else:
                     filename = token['attributes'].get('filename')
@@ -396,9 +419,10 @@ class FileApplication(object):
                 asyncio.run_coroutine_threadsafe(resp.write(read), loop=self.loop).result()
 
         try:
-            await self.middleware.run_in_io_thread(do_copy)
+            await self._cleanup_cancel(job_id)
+            await self.middleware.run_in_thread(do_copy)
         finally:
-            await self._cleanup_job(job_id)
+            await job.pipes.close()
 
         await resp.drain()
         return resp
@@ -464,22 +488,25 @@ class FileApplication(object):
             return resp
 
         def copy():
-            while True:
-                read = asyncio.run_coroutine_threadsafe(
-                    filepart.read_chunk(1048576),
-                    loop=self.loop,
-                ).result()
-                if read == b'':
-                    break
-                job.pipes.input.w.write(read)
+            try:
+                try:
+                    while True:
+                        read = asyncio.run_coroutine_threadsafe(
+                            filepart.read_chunk(filepart.chunk_size),
+                            loop=self.loop,
+                        ).result()
+                        if read == b'':
+                            break
+                        job.pipes.input.w.write(read)
+                finally:
+                    job.pipes.input.w.close()
+            except BrokenPipeError:
+                pass
 
         try:
             job = await self.middleware.call(data['method'], *(data.get('params') or []),
                                              pipes=Pipes(input=self.middleware.pipe()))
-            try:
-                await self.middleware.run_in_io_thread(copy)
-            finally:
-                await self.middleware.run_in_io_thread(job.pipes.input.w.close)
+            await self.middleware.run_in_thread(copy)
         except CallError as e:
             if e.errno == CallError.ENOMETHOD:
                 status_code = 422
@@ -499,6 +526,9 @@ class FileApplication(object):
         return resp
 
 
+ShellResize = namedtuple("ShellResize", ["cols", "rows"])
+
+
 class ShellWorkerThread(threading.Thread):
     """
     Worker thread responsible for forking and running the shell
@@ -514,26 +544,25 @@ class ShellWorkerThread(threading.Thread):
         self._die = False
         super(ShellWorkerThread, self).__init__(daemon=True)
 
+    def resize(self, cols, rows):
+        self.input_queue.put(ShellResize(cols, rows))
+
     def run(self):
 
         self.shell_pid, master_fd = os.forkpty()
         if self.shell_pid == 0:
-            for i in range(3, 1024):
-                if i == master_fd:
-                    continue
-                try:
-                    os.close(i)
-                except Exception:
-                    pass
+            osc.close_fds(3)
+
             os.chdir('/root')
             cmd = [
-                '/usr/local/bin/bash'
+                '/usr/bin/login', '-fp', 'root',
             ]
 
             if self.jail is not None:
                 cmd = [
                     '/usr/local/bin/iocage',
                     'console',
+                    '-f',
                     self.jail
                 ]
             os.execve(cmd[0], cmd, {
@@ -542,6 +571,11 @@ class ShellWorkerThread(threading.Thread):
                 'LANG': 'en_US.UTF-8',
                 'PATH': '/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:/root/bin',
             })
+
+        # Terminal baudrate affects input queue size
+        attr = termios.tcgetattr(master_fd)
+        attr[4] = attr[5] = termios.B921600
+        termios.tcsetattr(master_fd, termios.TCSANOW, attr)
 
         def reader():
             """
@@ -564,7 +598,10 @@ class ShellWorkerThread(threading.Thread):
             while True:
                 try:
                     get = self.input_queue.get(timeout=1)
-                    os.write(master_fd, get)
+                    if isinstance(get, ShellResize):
+                        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", get.rows, get.cols, 0, 0))
+                    else:
+                        os.write(master_fd, get)
                 except queue.Empty:
                     # If we timeout waiting in input query lets make sure
                     # the shell process is still alive
@@ -599,10 +636,12 @@ class ShellWorkerThread(threading.Thread):
 
 
 class ShellConnectionData(object):
+    id = None
     t_worker = None
 
 
 class ShellApplication(object):
+    shells = {}
 
     def __init__(self, middleware):
         self.middleware = middleware
@@ -612,13 +651,15 @@ class ShellApplication(object):
         await ws.prepare(request)
 
         conndata = ShellConnectionData()
+        conndata.id = str(uuid.uuid4())
 
         try:
             await self.run(ws, request, conndata)
-        except Exception as e:
+        except Exception:
             if conndata.t_worker:
                 await self.worker_kill(conndata.t_worker)
         finally:
+            self.shells.pop(conndata.id, None)
             return ws
 
     async def run(self, ws, request, conndata):
@@ -660,11 +701,14 @@ class ShellApplication(object):
                 authenticated = True
                 await ws.send_json({
                     'msg': 'connected',
+                    'id': conndata.id,
                 })
 
                 jail = data.get('jail')
                 conndata.t_worker = ShellWorkerThread(ws=ws, input_queue=input_queue, loop=asyncio.get_event_loop(), jail=jail)
                 conndata.t_worker.start()
+
+                self.shells[conndata.id] = conndata.t_worker
 
         # If connection was not authenticated, return earlier
         if not authenticated:
@@ -705,81 +749,115 @@ class ShellApplication(object):
         await self.middleware.run_in_thread(t_worker.join)
 
 
-class Middleware(object):
+class Middleware(LoadPluginsMixin, RunInThreadMixin):
 
-    def __init__(self, loop_monitor=True, overlay_dirs=None, debug_level=None):
-        self.logger = logger.Logger('middlewared', debug_level).getLogger()
+    CONSOLE_ONCE_PATH = '/tmp/.middlewared-console-once'
+
+    def __init__(
+        self, loop_debug=False, loop_monitor=True, overlay_dirs=None, debug_level=None,
+        log_handler=None, startup_seq_path=None,
+        log_format='[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s'
+    ):
+        super().__init__(overlay_dirs)
+        self.logger = logger.Logger(
+            'middlewared', debug_level, log_format
+        ).getLogger()
         self.crash_reporting = logger.CrashReporting()
+        self.crash_reporting_semaphore = asyncio.Semaphore(value=2)
+        self.loop_debug = loop_debug
         self.loop_monitor = loop_monitor
-        self.overlay_dirs = overlay_dirs or []
-        self.__loop = None
+        self.debug_level = debug_level
+        self.log_handler = log_handler
+        self.log_format = log_format
+        self.startup_seq = 0
+        self.startup_seq_path = startup_seq_path
+        self.app = None
+        self.loop = None
+        self.run_in_thread_executor = IoThreadPoolExecutor('IoThread', 20)
         self.__thread_id = threading.get_ident()
         # Spawn new processes for ProcessPool instead of forking
         multiprocessing.set_start_method('spawn')
-        self.__procpool = ProcessPoolExecutor(max_workers=2)
-        self.__threadpool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-        self.jobs = JobsQueue(self)
-        self.__schemas = {}
-        self.__services = {}
+        self.__ws_threadpool = concurrent.futures.ThreadPoolExecutor(
+            initializer=lambda: osc.set_thread_name('threadpool_ws'),
+            max_workers=10,
+        )
+        self.__init_procpool()
         self.__wsclients = {}
+        self.__events = Events()
         self.__event_sources = {}
         self.__event_subs = defaultdict(list)
         self.__hooks = defaultdict(list)
         self.__server_threads = []
         self.__init_services()
+        self.__console_io = False if os.path.exists(self.CONSOLE_ONCE_PATH) else None
+        self.__terminate_task = None
+        self.jobs = JobsQueue(self)
 
     def __init_services(self):
         from middlewared.service import CoreService
         self.add_service(CoreService(self))
 
     async def __plugins_load(self):
-        from middlewared.service import Service, CRUDService, ConfigService, SystemServiceService
-
-        main_plugins_dir = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)),
-            'plugins',
-        )
-        plugins_dirs = [os.path.join(overlay_dir, 'plugins') for overlay_dir in self.overlay_dirs]
-        plugins_dirs.insert(0, main_plugins_dir)
-
-        self.logger.debug('Loading plugins from {0}'.format(','.join(plugins_dirs)))
 
         setup_funcs = []
-        for plugins_dir in plugins_dirs:
 
-            if not os.path.exists(plugins_dir):
-                raise ValueError(f'plugins dir not found: {plugins_dir}')
+        def on_module_begin(mod):
+            self._console_write(f'loaded plugin {mod.__name__}')
+            self.__notify_startup_progress()
 
-            for mod in load_modules(plugins_dir):
-                for cls in load_classes(mod, Service, (ConfigService, CRUDService, SystemServiceService)):
-                    self.add_service(cls(self))
+        def on_module_end(mod):
+            if not hasattr(mod, 'setup'):
+                return
 
-                if hasattr(mod, 'setup'):
-                    setup_funcs.append(mod.setup)
+            mod_name = mod.__name__.split('.')
+            setup_plugin = mod_name[mod_name.index('plugins') + 1]
 
-        # Now that all plugins have been loaded we can resolve all method params
-        # to make sure every schema is patched and references match
-        from middlewared.schema import resolver  # Lazy import so namespace match
-        to_resolve = []
-        for service in list(self.__services.values()):
-            for attr in dir(service):
-                to_resolve.append(getattr(service, attr))
-        while len(to_resolve) > 0:
-            resolved = 0
-            for method in list(to_resolve):
-                try:
-                    resolver(self, method)
-                except ResolverError:
-                    pass
-                else:
-                    to_resolve.remove(method)
-                    resolved += 1
-            if resolved == 0:
-                raise ValueError(f'Not all schemas could be resolved: {to_resolve}')
+            setup_funcs.append((setup_plugin, mod.setup))
+
+        def on_modules_loaded():
+            self._console_write(f'resolving plugins schemas')
+
+        self._load_plugins(
+            on_module_begin=on_module_begin,
+            on_module_end=on_module_end,
+            on_modules_loaded=on_modules_loaded,
+        )
+
+        return setup_funcs
+
+    async def __plugins_setup(self, setup_funcs):
+
+        # TODO: Rework it when we have order defined for setup functions
+        def sort_key(plugin__function):
+            plugin, function = plugin__function
+
+            beginning = [
+                'datastore',
+                # We run boot plugin first to ensure we are able to retrieve
+                # BOOT POOL during system plugin initialization
+                'boot',
+                # We need to run system plugin setup's function first because when system boots, the right
+                # timezone is not configured. See #72131
+                'system',
+                # We also need to load alerts first because other plugins can issue one-shot alerts during their
+                # initialization
+                'alert',
+                # Migrate users and groups ASAP
+                'account',
+            ]
+            try:
+                return beginning.index(plugin)
+            except ValueError:
+                return len(beginning)
+        setup_funcs = sorted(setup_funcs, key=sort_key)
 
         # Only call setup after all schemas have been resolved because
         # they can call methods with schemas defined.
-        for f in setup_funcs:
+        setup_total = len(setup_funcs)
+        for i, setup_func in enumerate(setup_funcs):
+            name, f = setup_func
+            self._console_write(f'setting up plugins ({name}) [{i + 1}/{setup_total}]')
+            self.__notify_startup_progress()
             call = f(self)
             # Allow setup to be a coroutine
             if asyncio.iscoroutinefunction(f):
@@ -787,8 +865,8 @@ class Middleware(object):
 
         self.logger.debug('All plugins loaded')
 
-    def __setup_periodic_tasks(self):
-        for service_name, service_obj in self.__services.items():
+    def _setup_periodic_tasks(self):
+        for service_name, service_obj in self.get_services().items():
             for task_name in dir(service_obj):
                 method = getattr(service_obj, task_name)
                 if callable(method) and hasattr(method, "_periodic"):
@@ -800,7 +878,7 @@ class Middleware(object):
                     method_name = f'{service_name}.{task_name}'
                     self.logger.debug(f"Setting up periodic task {method_name} to run every {method._periodic.interval} seconds")
 
-                    self.__loop.call_later(
+                    self.loop.call_later(
                         delay,
                         functools.partial(
                             self.__call_periodic_task,
@@ -809,7 +887,7 @@ class Middleware(object):
                     )
 
     def __call_periodic_task(self, method, service_name, service_obj, method_name, interval):
-        self.__loop.create_task(self.__periodic_task_wrapper(method, service_name, service_obj, method_name, interval))
+        self.loop.create_task(self.__periodic_task_wrapper(method, service_name, service_obj, method_name, interval))
 
     async def __periodic_task_wrapper(self, method, service_name, service_obj, method_name, interval):
         self.logger.trace("Calling periodic task %s", method_name)
@@ -818,7 +896,7 @@ class Middleware(object):
         except Exception:
             self.logger.warning("Exception while calling periodic task", exc_info=True)
 
-        self.__loop.call_later(
+        self.loop.call_later(
             interval,
             functools.partial(
                 self.__call_periodic_task,
@@ -826,13 +904,92 @@ class Middleware(object):
             )
         )
 
+    def _console_write(self, text, fill_blank=True, append=False):
+        """
+        Helper method to write the progress of middlewared loading to the
+        system console.
+
+        There are some cases where loading will take a considerable amount of time,
+        giving user at least some basic feedback is fundamental.
+        """
+        # False means we are running in a terminal, no console needed
+        self.logger.trace('_console_write %r', text)
+        if self.__console_io is False:
+            return
+        elif self.__console_io is None:
+            if sys.stdin and sys.stdin.isatty():
+                self.__console_io = False
+                return
+            try:
+                self.__console_io = open('/dev/console', 'w')
+            except Exception:
+                return
+            try:
+                # We need to make sure we only try to write to console one time
+                # in case middlewared crashes and keep writing to console in a loop.
+                with open(self.CONSOLE_ONCE_PATH, 'w'):
+                    pass
+            except Exception:
+                pass
+        try:
+            if append:
+                self.__console_io.write(text)
+            else:
+                prefix = 'middlewared: '
+                maxlen = 60
+                text = text[:maxlen - len(prefix)]
+                # new line needs to go after all the blanks
+                if text.endswith('\n'):
+                    newline = '\n'
+                    text = text[:-1]
+                else:
+                    newline = ''
+                if fill_blank:
+                    blank = ' ' * (maxlen - (len(prefix) + len(text)))
+                else:
+                    blank = ''
+                writes = self.__console_io.write(
+                    f'\r{prefix}{text}{blank}{newline}'
+                )
+            self.__console_io.flush()
+            return writes
+        except OSError:
+            self.logger.debug('Failed to write to console', exc_info=True)
+        except Exception:
+            pass
+
+    def __notify_startup_progress(self):
+        if platform.system() == 'FreeBSD':
+            if self.startup_seq_path is None:
+                return
+
+            with open(self.startup_seq_path + ".tmp", "w") as f:
+                f.write(f"{self.startup_seq}")
+
+            os.rename(self.startup_seq_path + ".tmp", self.startup_seq_path)
+
+            self.startup_seq += 1
+
+        if platform.system() == 'Linux':
+            systemd_notify(f'EXTEND_TIMEOUT_USEC={int(240 * 1e6)}')
+
+    def __notify_startup_complete(self):
+        if platform.system() == 'Linux':
+            systemd_notify('READY=1')
+
+    def plugin_route_add(self, plugin_name, route, method):
+        self.app.router.add_route('*', f'/_plugins/{plugin_name}/{route}', method)
+
+    def get_wsclients(self):
+        return self.__wsclients
+
     def register_wsclient(self, client):
-        self.__wsclients[client.sessionid] = client
+        self.__wsclients[client.session_id] = client
 
     def unregister_wsclient(self, client):
-        self.__wsclients.pop(client.sessionid)
+        self.__wsclients.pop(client.session_id)
 
-    def register_hook(self, name, method, sync=True):
+    def register_hook(self, name, method, sync=True, inline=False):
         """
         Register a hook under `name`.
 
@@ -841,11 +998,30 @@ class Middleware(object):
             name(str): name of the hook, e.g. service.hook_name
             method(callable): method to be called
             sync(bool): whether the method should be called in a sync way
+            inline(bool): whether the method should be called in executor's context synchronously
         """
+
+        if inline:
+            if asyncio.iscoroutinefunction(method):
+                raise RuntimeError('You can\'t register coroutine function as inline hook')
+
+            if not sync:
+                raise RuntimeError('Inline hooks are always called in a sync way')
+
         self.__hooks[name].append({
             'method': method,
+            'inline': inline,
             'sync': sync,
         })
+
+    def _call_hook_base(self, name, *args, **kwargs):
+        for hook in self.__hooks[name]:
+            try:
+                yield hook, hook['method'](self, *args, **kwargs)
+            except Exception:
+                self.logger.error(
+                    'Failed to run hook {}:{}(*{}, **{})'.format(name, hook['method'], args, kwargs), exc_info=True
+                )
 
     async def call_hook(self, name, *args, **kwargs):
         """
@@ -853,16 +1029,26 @@ class Middleware(object):
         Args:
             name(str): name of the hook, e.g. service.hook_name
         """
-        for hook in self.__hooks[name]:
+        for hook, fut in self._call_hook_base(name, *args, **kwargs):
             try:
-                fut = hook['method'](*args, **kwargs)
-                if hook['sync']:
+                if hook['inline']:
+                    raise RuntimeError('Inline hooks should be called with call_hook_inline')
+                elif hook['sync']:
                     await fut
                 else:
                     asyncio.ensure_future(fut)
-
             except Exception:
-                self.logger.error('Failed to run hook {}:{}(*{}, **{})'.format(name, hook['method'], args, kwargs), exc_info=True)
+                self.logger.error(
+                    'Failed to run hook {}:{}(*{}, **{})'.format(name, hook['method'], args, kwargs), exc_info=True
+                )
+
+    def call_hook_sync(self, name, *args, **kwargs):
+        return self.run_coroutine(self.call_hook(name, *args, **kwargs))
+
+    def call_hook_inline(self, name, *args, **kwargs):
+        for hook, fut in self._call_hook_base(name, *args, **kwargs):
+            if not hook['inline']:
+                raise RuntimeError('Only inline hooks can be called with call_hook_inline')
 
     def register_event_source(self, name, event_source):
         if not issubclass(event_source, EventSource):
@@ -871,25 +1057,6 @@ class Middleware(object):
 
     def get_event_source(self, name):
         return self.__event_sources.get(name)
-
-    def add_service(self, service):
-        self.__services[service._config.namespace] = service
-
-    def get_service(self, name):
-        return self.__services[name]
-
-    def get_services(self):
-        return self.__services
-
-    def add_schema(self, schema):
-        if schema.name in self.__schemas:
-            raise ValueError('Schema "{0}" is already registered'.format(
-                schema.name
-            ))
-        self.__schemas[schema.name] = schema
-
-    def get_schema(self, name):
-        return self.__schemas.get(name)
 
     async def run_in_executor(self, pool, method, *args, **kwargs):
         """
@@ -901,24 +1068,43 @@ class Middleware(object):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(pool, functools.partial(method, *args, **kwargs))
 
-    async def run_in_thread(self, method, *args, **kwargs):
-        return await self.run_in_executor(self.__threadpool, method, *args, **kwargs)
+    async def _run_in_conn_threadpool(self, method, *args, **kwargs):
+        """
+        Threads to handle websocket connection are gated on `__ws_threadpool`.
+        Any other calls should use `run_in_thread` as that launches its own thread
+        and does not cause deadlock waiting another thread to finish in the pool
+        (which could happen on the stack call, e.g.
+           service.foo calls something in using the thread pool and something also
+           uses the thread pool. If service.foo is called many times before each thread
+           finishes we will have a deadlock)
+        """
+        return await self.run_in_executor(self.__ws_threadpool, method, *args, **kwargs)
+
+    def __init_procpool(self):
+        self.__procpool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=5,
+            initializer=functools.partial(
+                worker_init, self.overlay_dirs, self.debug_level, self.log_handler
+            ),
+        )
 
     async def run_in_proc(self, method, *args, **kwargs):
-        return await self.run_in_executor(self.__procpool, method, *args, **kwargs)
-
-    async def run_in_io_thread(self, method, *args, **kwargs):
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            return await self.loop.run_in_executor(executor, functools.partial(method, *args, **kwargs))
-        finally:
-            executor.shutdown(wait=False)
+        retries = 2
+        for i in range(retries):
+            try:
+                return await self.run_in_executor(self.__procpool, method, *args, **kwargs)
+            except concurrent.futures.process.BrokenProcessPool:
+                if i == retries - 1:
+                    raise
+                self.__init_procpool()
 
     def pipe(self):
         return Pipe(self)
 
-    async def _call(self, name, serviceobj, methodobj, params=None, app=None, pipes=None, spawn_thread=True):
-
+    async def _call(
+        self, name, serviceobj, methodobj, params=None, app=None, pipes=None,
+        job_on_progress_cb=None, io_thread=True,
+    ):
         args = []
         if hasattr(methodobj, '_pass_app'):
             args.append(app)
@@ -934,7 +1120,10 @@ class Middleware(object):
             if serviceobj._config.process_pool is True:
                 job_options['process'] = True
             # Create a job instance with required args
-            job = Job(self, name, serviceobj, methodobj, args, job_options, pipes)
+            job = Job(
+                self, name, serviceobj, methodobj, args, job_options, pipes,
+                on_progress_cb=job_on_progress_cb,
+            )
             # Add the job to the queue.
             # At this point an `id` is assinged to the job.
             job = self.jobs.add(job)
@@ -947,36 +1136,27 @@ class Middleware(object):
 
             # Currently its only a boolean
             if serviceobj._config.process_pool is True:
-                return await self._call_worker(serviceobj, name, *args)
+                return await self._call_worker(name, *args)
 
             if asyncio.iscoroutinefunction(methodobj):
                 return await methodobj(*args)
-            elif not spawn_thread and threading.get_ident() != self.__thread_id:
-                # If this method is already being called from a thread we dont need to spawn
-                # another one or we may run out of threads and deadlock.
-                # e.g. multiple concurrent calls to a threaded method which uses call_sync
-                return methodobj(*args)
+
+            tpool = None
+            if serviceobj._config.thread_pool:
+                tpool = serviceobj._config.thread_pool
+            if hasattr(methodobj, '_thread_pool'):
+                tpool = methodobj._thread_pool
+            if tpool:
+                return await self.run_in_executor(tpool, methodobj, *args)
+
+            if io_thread:
+                run_method = self.run_in_thread
             else:
-                tpool = None
-                if serviceobj._config.thread_pool:
-                    tpool = serviceobj._config.thread_pool
-                if hasattr(methodobj, '_thread_pool'):
-                    tpool = methodobj._thread_pool
-                if tpool:
-                    return await self.run_in_executor(tpool, methodobj, *args)
+                run_method = self._run_in_conn_threadpool
+            return await run_method(methodobj, *args)
 
-                return await self.run_in_thread(methodobj, *args)
-
-    async def _call_worker(self, serviceobj, name, *args, job=None):
-        return await self.run_in_proc(
-            main_worker,
-            # For now only plugins in middlewared.plugins are supported
-            f'middlewared.plugins.{serviceobj.__class__.__module__}',
-            serviceobj.__class__.__name__,
-            name.rsplit('.', 1)[-1],
-            args,
-            job,
-        )
+    async def _call_worker(self, name, *args, job=None):
+        return await self.run_in_proc(main_worker, name, args, job)
 
     def _method_lookup(self, name):
         if '.' not in name:
@@ -1002,30 +1182,42 @@ class Middleware(object):
 
         return [method.accepts[i].dump(arg) for i, arg in enumerate(args) if i < len(method.accepts)]
 
-    async def call_method(self, app, message):
-        """Call method from websocket"""
-        params = message.get('params') or []
-        serviceobj, methodobj = self._method_lookup(message['method'])
-
-        if not app.authenticated and not hasattr(methodobj, '_no_auth_required'):
-            app.send_error(message, errno.EACCES, 'Not authenticated')
-            return
-
-        return await self._call(message['method'], serviceobj, methodobj, params, app=app)
-
-    async def call(self, name, *params, pipes=None):
+    async def call(self, name, *params, pipes=None, job_on_progress_cb=None, app=None, profile=False):
         serviceobj, methodobj = self._method_lookup(name)
-        return await self._call(name, serviceobj, methodobj, params, pipes=pipes)
 
-    def call_sync(self, name, *params):
+        if profile:
+            methodobj = profile_wrap(methodobj)
+        return await self._call(
+            name, serviceobj, methodobj, params,
+            app=app, pipes=pipes, job_on_progress_cb=job_on_progress_cb, io_thread=True,
+        )
+
+    def call_sync(self, name, *params, job_on_progress_cb=None, wait=True):
         """
         Synchronous method call to be used from another thread.
         """
-        if threading.get_ident() == self.__thread_id:
-            raise RuntimeError('You cannot call_sync from main thread')
 
         serviceobj, methodobj = self._method_lookup(name)
-        fut = asyncio.run_coroutine_threadsafe(self._call(name, serviceobj, methodobj, params, spawn_thread=False), self.__loop)
+        # This method is already being called from a thread so we cant use the same
+        # thread pool or we may get in a deadlock situation if all threads in the default
+        # pool are waiting.
+        # Instead we launch a new thread just for that call (io_thread).
+        return self.run_coroutine(
+            self._call(
+                name, serviceobj, methodobj, params,
+                io_thread=True, job_on_progress_cb=job_on_progress_cb,
+            ),
+            wait=wait,
+        )
+
+    def run_coroutine(self, coro, wait=True):
+        if threading.get_ident() == self.__thread_id:
+            raise RuntimeError('You cannot call_sync or run_coroutine from main thread')
+
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        if not wait:
+            return fut
+
         event = threading.Event()
 
         def done(_):
@@ -1035,9 +1227,20 @@ class Middleware(object):
 
         # In case middleware dies while we are waiting for a `call_sync` result
         while not event.wait(1):
-            if not self.__loop.is_running():
+            if not self.loop.is_running():
                 raise RuntimeError('Middleware is terminating')
         return fut.result()
+
+    def get_events(self):
+        return itertools.chain(
+            self.__events, map(
+                lambda n: (
+                    n[0], {
+                        'description': inspect.getdoc(n[1]), 'wildcard_subscription': False,
+                    }
+                ), self.__event_sources.items()
+            )
+        )
 
     def event_subscribe(self, name, handler):
         """
@@ -1045,42 +1248,73 @@ class Middleware(object):
         """
         self.__event_subs[name].append(handler)
 
+    def event_register(self, name, description):
+        """
+        All events middleware can send should be registered so they are properly documented
+        and can be browsed in documentation page without source code inspection.
+        """
+        self.__events.register(name, description)
+
     def send_event(self, name, event_type, **kwargs):
+
+        if name not in self.__events:
+            # We should eventually deny events that are not registered to ensure every event is
+            # documented but for backward-compability and safety just log it for now.
+            self.logger.warn(f'Event {name!r} not registered.')
+
         assert event_type in ('ADDED', 'CHANGED', 'REMOVED')
 
-        self.logger.trace(f'Sending event "{event_type}":{kwargs}')
+        self.logger.trace(f'Sending event {name!r}:{event_type!r}:{kwargs!r}')
 
-        for sessionid, wsclient in self.__wsclients.items():
+        for session_id, wsclient in list(self.__wsclients.items()):
             try:
                 wsclient.send_event(name, event_type, **kwargs)
             except Exception:
-                self.logger.warn('Failed to send event {} to {}'.format(name, sessionid), exc_info=True)
+                self.logger.warn('Failed to send event {} to {}'.format(name, session_id), exc_info=True)
 
         # Send event also for internally subscribed plugins
         for handler in self.__event_subs.get(name, []):
-            asyncio.ensure_future(handler(self, event_type, kwargs))
+            asyncio.run_coroutine_threadsafe(handler(self, event_type, kwargs), loop=self.loop)
 
     def pdb(self):
         import pdb
         pdb.set_trace()
 
+    def log_threads_stacks(self):
+        for thread_id, stack in get_threads_stacks().items():
+            self.logger.debug('Thread %d stack:\n%s', thread_id, ''.join(stack))
+
     async def ws_handler(self, request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        connection = Application(self, self.__loop, request, ws)
+        connection = Application(self, self.loop, request, ws)
         connection.on_open()
 
-        async for msg in ws:
-            x = json.loads(msg.data)
-            try:
-                await connection.on_message(x)
-            except Exception as e:
-                self.logger.error('Connection closed unexpectedly', exc_info=True)
-                await ws.close(message=str(e).encode('utf-8'))
+        try:
+            async for msg in ws:
+                if not connection.authenticated and len(msg.data) > 8192:
+                    await ws.close(message='Anonymous connection max message length is 8 kB'.encode('utf-8'))
+                    break
 
-        await connection.on_close()
+                x = json.loads(msg.data)
+                try:
+                    await connection.on_message(x)
+                except Exception as e:
+                    self.logger.error('Connection closed unexpectedly', exc_info=True)
+                    await ws.close(message=str(e).encode('utf-8'))
+                    break
+        finally:
+            await connection.on_close()
         return ws
+
+    _loop_monitor_ignore_frames = (
+        (
+            re.compile(r'\s+File ".+/middlewared/main\.py", line [0-9]+, in run_in_thread\s+'
+                       'return await self.loop.run_in_executor'),
+            'run_in_thread'
+        ),
+    )
 
     def _loop_monitor_thread(self):
         """
@@ -1090,29 +1324,58 @@ class Middleware(object):
         DISCLAIMER/TODO: This is not free of race condition so it may show
         false positives.
         """
+        osc.set_thread_name('loop_monitor')
         last = None
         while True:
             time.sleep(2)
-            current = asyncio.Task.current_task(loop=self.__loop)
+            current = asyncio.current_task(loop=self.loop)
             if current is None:
                 last = None
                 continue
             if last == current:
                 frame = sys._current_frames()[self.__thread_id]
                 stack = traceback.format_stack(frame, limit=10)
-                self.logger.warn(''.join(['Task seems blocked:'] + stack))
+                for regex, name in self._loop_monitor_ignore_frames:
+                    if any(regex.match(s) for s in stack):
+                        self.logger.warn('%s seems to be blocking event loop', name)
+                        break
+                else:
+                    self.logger.warn(''.join(['Task seems blocked:\n'] + stack))
             last = current
 
     def run(self):
-        self.loop = self.__loop = asyncio.get_event_loop()
 
-        if self.loop_monitor:
-            self.__loop.set_debug(True)
-            # loop.slow_callback_duration(0.2)
+        self._console_write('starting')
+
+        osc.set_thread_name('asyncio_loop')
+        self.loop = asyncio.get_event_loop()
+
+        if self.loop_debug:
+            self.loop.set_debug(True)
+            self.loop.slow_callback_duration = 0.2
+
+        self.loop.create_task(self.__initialize())
+
+        try:
+            self.loop.run_forever()
+        except RuntimeError as e:
+            if e.args[0] != "Event loop is closed":
+                raise
+
+        # We use "_exit" specifically as otherwise process pool executor won't let middlewared process die because
+        # it is still active. We don't initiate a shutdown for it because it may hang forever for any reason
+        os._exit(0)
+
+    async def __initialize(self):
+        self.app = app = web.Application(middlewares=[
+            normalize_path_middleware(redirect_class=HTTPPermanentRedirect)
+        ], loop=self.loop)
 
         # Needs to happen after setting debug or may cause race condition
         # http://bugs.python.org/issue30805
-        self.__loop.run_until_complete(self.__plugins_load())
+        setup_funcs = await self.__plugins_load()
+
+        self._console_write('registering services')
 
         if self.loop_monitor:
             # Start monitor thread after plugins have been loaded
@@ -1121,18 +1384,17 @@ class Middleware(object):
             t.setDaemon(True)
             t.start()
 
-        self.__loop.add_signal_handler(signal.SIGINT, self.terminate)
-        self.__loop.add_signal_handler(signal.SIGTERM, self.terminate)
-        self.__loop.add_signal_handler(signal.SIGUSR1, self.pdb)
+        self.loop.add_signal_handler(signal.SIGINT, self.terminate)
+        self.loop.add_signal_handler(signal.SIGTERM, self.terminate)
+        self.loop.add_signal_handler(signal.SIGUSR1, self.pdb)
+        self.loop.add_signal_handler(signal.SIGUSR2, self.log_threads_stacks)
 
-        app = web.Application(middlewares=[
-            normalize_path_middleware(redirect_class=HTTPPermanentRedirect)
-        ], loop=self.__loop)
         app.router.add_route('GET', '/websocket', self.ws_handler)
 
-        app.router.add_route("*", "/api/docs{path_info:.*}", WSGIHandler(apidocs_app))
+        app.router.add_route('*', '/api/docs{path_info:.*}', WSGIHandler(apidocs_app))
+        app.router.add_route('*', '/ui{path_info:.*}', WebUIAuth(self))
 
-        self.fileapp = FileApplication(self, self.__loop)
+        self.fileapp = FileApplication(self, self.loop)
         app.router.add_route('*', '/_download{path_info:.*}', self.fileapp.download)
         app.router.add_route('*', '/_upload{path_info:.*}', self.fileapp.upload)
 
@@ -1140,47 +1402,62 @@ class Middleware(object):
         app.router.add_route('*', '/_shell{path_info:.*}', shellapp.ws_handler)
 
         restful_api = RESTfulAPI(self, app)
-        self.__loop.run_until_complete(
-            asyncio.ensure_future(restful_api.register_resources())
-        )
+        await restful_api.register_resources()
         asyncio.ensure_future(self.jobs.run())
-
-        self.__setup_periodic_tasks()
 
         # Start up middleware worker process pool
         self.__procpool._start_queue_management_thread()
 
         runner = web.AppRunner(app, handle_signals=False, access_log=None)
-        self.__loop.run_until_complete(runner.setup())
-        self.__loop.run_until_complete(
-            web.TCPSite(runner, '0.0.0.0', 6000, reuse_address=True, reuse_port=True).start()
-        )
-        self.__loop.run_until_complete(web.UnixSite(runner, '/var/run/middlewared.sock').start())
+        await runner.setup()
+        await web.UnixSite(runner, '/var/run/middlewared-internal.sock').start()
+
+        await self.__plugins_setup(setup_funcs)
+
+        if await self.call('system.state') == 'READY':
+            self._setup_periodic_tasks()
+
+        await web.TCPSite(runner, '0.0.0.0', 6000, reuse_address=True, reuse_port=True).start()
+        await web.UnixSite(runner, '/var/run/middlewared.sock').start()
 
         self.logger.debug('Accepting connections')
+        self._console_write('loading completed\n')
 
-        try:
-            self.__loop.run_forever()
-        except RuntimeError as e:
-            if e.args[0] != "Event loop is closed":
-                raise
+        self.__notify_startup_complete()
 
     def terminate(self):
         self.logger.info('Terminating')
-
-        for task in asyncio.Task.all_tasks():
-            task.cancel()
-
-        self.__loop.create_task(self.__terminate())
+        self.__terminate_task = self.loop.create_task(self.__terminate())
 
     async def __terminate(self):
-        for service_name, service in self.__services.items():
+        for service_name, service in self.get_services().items():
             # We're using this instead of having no-op `terminate`
             # in base class to reduce number of awaits
             if hasattr(service, "terminate"):
-                await service.terminate()
+                self.logger.trace("Terminating %r", service)
+                timeout = None
+                if hasattr(service, 'terminate_timeout'):
+                    try:
+                        timeout = await asyncio.wait_for(self.call(f'{service_name}.terminate_timeout'), 5)
+                    except Exception:
+                        self.logger.error(
+                            'Failed to retrieve terminate timeout value for %s', service_name, exc_info=True
+                        )
 
-        self.__loop.stop()
+                # This is to ensure if some service returns 0 as a timeout value meaning it is probably not being
+                # used, we still give it the standard default 10 seconds timeout to ensure a clean exit
+                timeout = timeout or 10
+                try:
+                    await asyncio.wait_for(service.terminate(), timeout)
+                except Exception:
+                    self.logger.error('Failed to terminate %s', service_name, exc_info=True)
+
+        for task in asyncio.all_tasks(loop=self.loop):
+            if task != self.__terminate_task:
+                self.logger.trace("Canceling %r", task)
+                task.cancel()
+
+        self.loop.stop()
 
 
 def main():
@@ -1196,6 +1473,7 @@ def main():
     parser.add_argument('restart', nargs='?')
     parser.add_argument('--pidfile', '-P', action='store_true')
     parser.add_argument('--disable-loop-monitor', '-L', action='store_true')
+    parser.add_argument('--loop-debug', action='store_true')
     parser.add_argument('--overlay-dirs', '-o', action='append')
     parser.add_argument('--debug-level', choices=[
         'TRACE',
@@ -1210,10 +1488,8 @@ def main():
     ], default='console')
     args = parser.parse_args()
 
-    _logger = logger.Logger('middleware', args.debug_level)
-    _logger.getLogger()
-
     pidpath = '/var/run/middlewared.pid'
+    startup_seq_path = '/tmp/middlewared_startup.seq'
 
     if args.restart:
         if os.path.exists(pidpath):
@@ -1225,26 +1501,21 @@ def main():
                 if e.errno != errno.ESRCH:
                     raise
 
-    if 'file' in args.log_handler:
-        _logger.configure_logging('file')
-        sys.stdout = sys.stderr = _logger.stream()
-    elif 'console' in args.log_handler:
-        _logger.configure_logging('console')
-    else:
-        _logger.configure_logging('file')
+    logger.setup_logging('middleware', args.debug_level, args.log_handler)
 
     setproctitle.setproctitle('middlewared')
-    # Workaround to tell django to not set up logging on its own
-    os.environ['MIDDLEWARED'] = str(os.getpid())
 
     if args.pidfile:
         with open(pidpath, "w") as _pidfile:
             _pidfile.write(f"{str(os.getpid())}\n")
 
     Middleware(
+        loop_debug=args.loop_debug,
         loop_monitor=not args.disable_loop_monitor,
         overlay_dirs=args.overlay_dirs,
         debug_level=args.debug_level,
+        log_handler=args.log_handler,
+        startup_seq_path=startup_seq_path,
     ).run()
 
 

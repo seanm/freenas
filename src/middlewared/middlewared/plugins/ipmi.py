@@ -1,8 +1,12 @@
-from bsd import kld
+try:
+    from bsd import kld
+except ImportError:
+    kld = None
 
-from middlewared.schema import Bool, Dict, Int, Str, accepts
-from middlewared.service import CallError, CRUDService, filterable
+from middlewared.schema import Bool, Dict, Int, IPAddr, Str, accepts
+from middlewared.service import CallError, CRUDService, filterable, ValidationErrors
 from middlewared.utils import filter_list, run
+from middlewared.validators import Netmask
 
 import errno
 import os
@@ -15,6 +19,9 @@ class IPMIService(CRUDService):
 
     @accepts()
     async def is_loaded(self):
+        """
+        Returns a boolean true value indicating if ipmi device is loaded.
+        """
         return os.path.exists('/dev/ipmi0')
 
     @accepts()
@@ -26,6 +33,9 @@ class IPMIService(CRUDService):
 
     @filterable
     async def query(self, filters=None, options=None):
+        """
+        Query all IPMI Channels with `query-filters` and `query-options`.
+        """
         result = []
         for channel in await self.channels():
             try:
@@ -64,17 +74,45 @@ class IPMIService(CRUDService):
 
     @accepts(Int('channel'), Dict(
         'ipmi',
-        Str('ipaddress'),
-        Str('netmask'),
-        Str('gateway'),
-        Str('password'),
+        IPAddr('ipaddress', v6=False),
+        Str('netmask', validators=[Netmask(ipv6=False, prefix_length=False)]),
+        IPAddr('gateway', v6=False),
+        Str('password', private=True),
         Bool('dhcp'),
-        Int('vlan'),
+        Int('vlan', null=True),
     ))
     async def do_update(self, id, data):
+        """
+        Update `id` IPMI Configuration.
+
+        `ipaddress` is a valid ip which will be used to connect to the IPMI interface.
+
+        `netmask` is the subnet mask associated with `ipaddress`.
+
+        `dhcp` is a boolean value which if unset means that `ipaddress`, `netmask` and `gateway` must be set.
+        """
 
         if not await self.is_loaded():
             raise CallError('The ipmi device could not be found')
+
+        verrors = ValidationErrors()
+
+        if data.get('password') and len(data.get('password')) > 20:
+            verrors.add(
+                'ipmi_update.password',
+                'A maximum of 20 characters are allowed'
+            )
+
+        if not data.get('dhcp'):
+            for k in ['ipaddress', 'netmask', 'gateway']:
+                if not data.get(k):
+                    verrors.add(
+                        f'ipmi_update.{k}',
+                        'This field is required when dhcp is not given'
+                    )
+
+        if verrors:
+            raise verrors
 
         args = ['ipmitool', 'lan', 'set', str(id)]
         rv = 0
@@ -86,7 +124,7 @@ class IPMIService(CRUDService):
             rv |= (await run(*args, 'netmask', data['netmask'], check=False)).returncode
             rv |= (await run(*args, 'defgw', 'ipaddr', data['gateway'], check=False)).returncode
         rv |= (await run(
-            *args, 'vlan', 'id', data['vlan'] if data.get('vlan') else 'off'
+            *args, 'vlan', 'id', str(data['vlan']) if data.get('vlan') else 'off'
         )).returncode
 
         rv |= (await run(*args, 'access', 'on', check=False)).returncode
@@ -135,7 +173,8 @@ class IPMIService(CRUDService):
 async def setup(middleware):
 
     try:
-        kld.kldload('/boot/kernel/ipmi.ko')
+        if kld:
+            kld.kldload('/boot/kernel/ipmi.ko')
     except OSError as e:
         # Only skip if not already loaded
         if e.errno != errno.EEXIST:
@@ -145,7 +184,7 @@ async def setup(middleware):
     # Scan available channels
     for i in range(1, 17):
         try:
-            await run('/usr/local/bin/ipmitool', 'lan', 'print', str(i))
+            await run('ipmitool', 'lan', 'print', str(i))
         except subprocess.CalledProcessError:
             continue
         channels.append(i)

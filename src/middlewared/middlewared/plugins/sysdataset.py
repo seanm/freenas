@@ -1,5 +1,6 @@
 from middlewared.schema import accepts, Bool, Dict, Str
-from middlewared.service import ConfigService, ValidationErrors, job, private
+from middlewared.service import CallError, ConfigService, ValidationErrors, job, private
+import middlewared.sqlalchemy as sa
 from middlewared.utils import Popen, run
 
 import asyncio
@@ -9,6 +10,16 @@ import shutil
 import uuid
 
 SYSDATASET_PATH = '/var/db/system'
+
+
+class SystemDatasetModel(sa.Model):
+    __tablename__ = 'system_systemdataset'
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    sys_pool = sa.Column(sa.String(1024))
+    sys_syslog_usedataset = sa.Column(sa.Boolean(), default=False)
+    sys_uuid = sa.Column(sa.String(32))
+    sys_uuid_b = sa.Column(sa.String(32), nullable=True)
 
 
 class SystemDatasetService(ConfigService):
@@ -21,8 +32,12 @@ class SystemDatasetService(ConfigService):
     @private
     async def config_extend(self, config):
 
+        # Treat empty system dataset pool as boot pool
+        boot_pool = await self.middleware.call('boot.pool_name')
+        if not config['pool']:
+            config['pool'] = boot_pool
         # Add `is_decrypted` dynamic attribute
-        if config['pool'] == 'freenas-boot':
+        if config['pool'] == boot_pool:
             config['is_decrypted'] = True
         else:
             pool = await self.middleware.call('pool.query', [('name', '=', config['pool'])])
@@ -39,15 +54,12 @@ class SystemDatasetService(ConfigService):
         # Make `uuid` point to the uuid of current node
         config['uuid_a'] = config['uuid']
         if not await self.middleware.call('system.is_freenas'):
-            if await self.middleware.call('notifier.failover_node') == 'B':
+            if await self.middleware.call('failover.node') == 'B':
                 config['uuid'] = config['uuid_b']
 
         if not config['uuid']:
             config['uuid'] = uuid.uuid4().hex
-            if (
-                not await self.middleware.call('system.is_freenas') and
-                await self.middleware.call('notifier.failover_node') == 'B'
-            ):
+            if not await self.middleware.call('system.is_freenas') and await self.middleware.call('failover.node') == 'B':
                 attr = 'uuid_b'
                 config[attr] = config['uuid']
             else:
@@ -55,7 +67,6 @@ class SystemDatasetService(ConfigService):
             await self.middleware.call('datastore.update', 'system.systemdataset', config['id'], {f'sys_{attr}': config['uuid']})
 
         config['syslog'] = config.pop('syslog_usedataset')
-        config['rrd'] = config.pop('rrd_usedataset')
 
         if not os.path.exists(SYSDATASET_PATH) or not os.path.ismount(SYSDATASET_PATH):
             config['path'] = None
@@ -66,78 +77,164 @@ class SystemDatasetService(ConfigService):
 
     @accepts(Dict(
         'sysdataset_update',
-        Str('pool'),
+        Str('pool', null=True),
+        Str('pool_exclude', null=True),
         Bool('syslog'),
-        Bool('rrd'),
+        update=True
     ))
     @job(lock='sysdataset_update')
     async def do_update(self, job, data):
+        """
+        Update System Dataset Service Configuration.
+
+        `pool` is the name of a valid pool configured in the system which will be used to host the system dataset.
+
+        `pool_exclude` can be specified to make sure that we don't place the system dataset on that pool if `pool`
+        is not provided.
+        """
         config = await self.config()
 
         new = config.copy()
         new.update(data)
 
         verrors = ValidationErrors()
-        if not await self.middleware.call('zfs.pool.query', [('name', '=', data['pool'])]):
-            verrors.add('sysdataset_update.pool', f'Pool "{data["pool"]}" not found', errno.ENOENT)
-        if verrors:
-            raise verrors
+        if new['pool'] and new['pool'] != await self.middleware.call('boot.pool_name'):
+            pool = await self.middleware.call('pool.query', [['name', '=', new['pool']]])
+            if not pool:
+                verrors.add(
+                    'sysdataset_update.pool',
+                    f'Pool "{new["pool"]}" not found',
+                    errno.ENOENT
+                )
+            elif pool[0]['encrypt'] == 2:
+                # This will cover two cases - passphrase being set for a pool and that it might be locked as well
+                verrors.add(
+                    'sysdataset_update.pool',
+                    f'Pool "{new["pool"]}" has an encryption passphrase set. '
+                    'The system dataset cannot be placed on this pool.'
+                )
+            elif await self.middleware.call(
+                'pool.dataset.query', [
+                    ['name', '=', new['pool']], ['encrypted', '=', True],
+                    ['OR', [['key_format.value', '=', 'PASSPHRASE'], ['locked', '=', True]]]
+                ]
+            ):
+                verrors.add(
+                    'sysdataset_update.pool',
+                    'The system dataset cannot be placed on a pool '
+                    'which has the root dataset encrypted with a passphrase or is locked.'
+                )
+        elif not new['pool']:
+            for pool in await self.middleware.call(
+                'pool.query', [
+                    ['encrypt', '!=', 2]
+                ]
+            ):
+                if data.get('pool_exclude') == pool['name'] or await self.middleware.call('pool.dataset.query', [
+                    ['name', '=', pool['name']], [
+                        'OR', [['key_format.value', '=', 'PASSPHRASE'], ['locked', '=', True]]
+                    ]
+                ]):
+                    continue
+                new['pool'] = pool['name']
+                break
+            else:
+                # If a data pool could not be found, reset it to blank
+                # Which will eventually mean its back to boot pool (temporarily)
+                new['pool'] = ''
+        verrors.check()
 
         new['syslog_usedataset'] = new['syslog']
-        new['rrd_usedataset'] = new['rrd']
-        await self.middleware.call('datastore.update', 'system.systemdataset', config['id'], new, {'prefix': 'sys_'})
 
-        if 'pool' in data and config['pool'] and data['pool'] != config['pool']:
-            await self.migrate(config['pool'], data['pool'])
+        update_dict = new.copy()
+        for key in ('is_decrypted', 'basename', 'uuid_a', 'syslog', 'path', 'pool_exclude'):
+            update_dict.pop(key, None)
 
-        if config['rrd'] != new['rrd']:
-            # Stop collectd to flush data
-            await self.middleware.call('service.stop', 'collectd')
+        await self.middleware.call(
+            'datastore.update',
+            'system.systemdataset',
+            config['id'],
+            update_dict,
+            {'prefix': 'sys_'}
+        )
 
-        await self.setup()
+        new = await self.config()
+
+        if config['pool'] != new['pool']:
+            await self.migrate(config['pool'], new['pool'])
+
+        await self.setup(True, data.get('pool_exclude'))
 
         if config['syslog'] != new['syslog']:
             await self.middleware.call('service.restart', 'syslogd')
 
-        if config['rrd'] != new['rrd']:
-            await self.rrd_toggle()
-            await self.middleware.call('service.restart', 'collectd')
-        return config
-
-    @accepts(Bool('mount', default=True))
-    @private
-    async def setup(self, mount):
-        config = await self.config()
-
-        if not await self.middleware.call('system.is_freenas'):
-            if await self.middleware.call('notifier.failover_status') == 'BACKUP' and \
-                    ('basename' in config and config['basename'] and config['basename'] != 'freenas-boot/.system'):
+        if not await self.middleware.call('system.is_freenas') and await self.middleware.call('failover.licensed'):
+            if await self.middleware.call('failover.status') == 'MASTER':
                 try:
-                    os.unlink(SYSDATASET_PATH)
-                except OSError:
-                    pass
-                return
+                    await self.middleware.call('failover.call_remote', 'system.reboot')
+                except Exception as e:
+                    self.logger.debug('Failed to reboot standby storage controller after system dataset change: %s', e)
 
-        if config['pool'] and config['pool'] != 'freenas-boot':
-            if not await self.middleware.call('pool.query', [('name', '=', config['pool'])]):
-                job = await self.middleware.call('systemdataset.update', {'pool': ''})
-                await job.wait()
-                config = await self.config()
+        return await self.config()
 
-        if not config['pool'] and not await self.middleware.call('system.is_freenas'):
-            job = await self.middleware.call('systemdataset.update', {'pool': 'freenas-boot'})
+    @accepts(Bool('mount', default=True), Str('exclude_pool', default=None, null=True))
+    @private
+    async def setup(self, mount, exclude_pool=None):
+        # We default kern.corefile value
+        await run('sysctl', "kern.corefile='/var/tmp/%N.core'")
+
+        config = await self.config()
+        dbconfig = await self.middleware.call(
+            'datastore.config', self._config.datastore, {'prefix': self._config.datastore_prefix}
+        )
+
+        boot_pool = await self.middleware.call('boot.pool_name')
+        if (
+            not await self.middleware.call('system.is_freenas') and
+            await self.middleware.call('failover.status') == 'BACKUP' and
+            config.get('basename') and config['basename'] != f'{boot_pool}/.system'
+        ):
+            try:
+                os.unlink(SYSDATASET_PATH)
+            except OSError:
+                pass
+            return
+
+        # If the system dataset is configured in a data pool we need to make sure it exists.
+        # In case it does not we need to use another one.
+        if config['pool'] != boot_pool and not await self.middleware.call(
+            'pool.query', [('name', '=', config['pool'])]
+        ):
+            job = await self.middleware.call('systemdataset.update', {
+                'pool': None, 'pool_exclude': exclude_pool,
+            })
             await job.wait()
-            config = await self.config()
-        elif not config['pool']:
+            if job.error:
+                raise CallError(job.error)
+            return
+
+        # If we dont have a pool configure in the database try to find the first data pool
+        # to put it on.
+        if not dbconfig['pool']:
             pool = None
-            for p in await self.middleware.call('pool.query', [], {'order_by': ['encrypt']}):
+            for p in await self.middleware.call(
+                'pool.query', [('encrypt', '!=', '2')], {'order_by': ['encrypt']}
+            ):
+                if (exclude_pool and p['name'] == exclude_pool) or await self.middleware.call('pool.dataset.query', [
+                    ['name', '=', p['name']], [
+                        'OR', [['key_format.value', '=', 'PASSPHRASE'], ['locked', '=', True]]
+                    ]
+                ]):
+                    continue
                 if p['is_decrypted']:
                     pool = p
                     break
             if pool:
                 job = await self.middleware.call('systemdataset.update', {'pool': pool['name']})
                 await job.wait()
-                config = await self.config()
+                if job.error:
+                    raise CallError(job.error)
+                return
 
         if not config['basename']:
             if os.path.exists(SYSDATASET_PATH):
@@ -152,19 +249,20 @@ class SystemDatasetService(ConfigService):
 
         if await self.__setup_datasets(config['pool'], config['uuid']):
             # There is no need to wait this to finish
-            asyncio.ensure_future(self.middleware.call('service.restart', 'collectd'))
+            # Restarting rrdcached will ensure that we start/restart collectd as well
+            asyncio.ensure_future(self.middleware.call('service.restart', 'rrdcached'))
 
         if not os.path.isdir(SYSDATASET_PATH):
             if os.path.exists(SYSDATASET_PATH):
                 os.unlink(SYSDATASET_PATH)
             os.mkdir(SYSDATASET_PATH)
 
-        aclmode = await self.middleware.call('zfs.dataset.query', [('id', '=', config['basename'])])
-        if aclmode and aclmode[0]['properties']['aclmode']['value'] == 'restricted':
+        acltype = await self.middleware.call('zfs.dataset.query', [('id', '=', config['basename'])])
+        if acltype and acltype[0]['properties']['acltype']['value'] == 'off':
             await self.middleware.call(
                 'zfs.dataset.update',
                 config['basename'],
-                {'properties': {'aclmode': {'value': 'passthrough'}}},
+                {'properties': {'acltype': {'value': 'off'}}},
             )
 
         if mount:
@@ -178,6 +276,8 @@ class SystemDatasetService(ConfigService):
                 os.chmod(corepath, 0o775)
 
             await self.__nfsv4link(config)
+            await self.middleware.call('etc.generate', 'smb_configure')
+            await self.middleware.call('dscache.initialize')
 
         return config
 
@@ -187,21 +287,29 @@ class SystemDatasetService(ConfigService):
         """
         createdds = False
         datasets = [i[0] for i in self.__get_datasets(pool, uuid)]
-        datasets_prop = {i['id']: i['properties'].get('mountpoint') for i in await self.middleware.call('zfs.dataset.query', [('id', 'in', datasets)])}
+        datasets_prop = {
+            i['id']: i['properties'] for i in await self.middleware.call('zfs.dataset.query', [('id', 'in', datasets)])
+        }
         for dataset in datasets:
-            mountpoint = datasets_prop.get(dataset)
-            if mountpoint and mountpoint['value'] != 'legacy':
-                await self.middleware.call(
-                    'zfs.dataset.update',
-                    dataset,
-                    {'properties': {'mountpoint': {'value': 'legacy'}}},
-                )
-            elif not mountpoint:
+            dataset_quota = {'quota': '1G'} if dataset.endswith('/cores') else {}
+            if dataset not in datasets_prop:
                 await self.middleware.call('zfs.dataset.create', {
                     'name': dataset,
-                    'properties': {'mountpoint': 'legacy'},
+                    'properties': {'mountpoint': 'legacy', **dataset_quota},
                 })
                 createdds = True
+            else:
+                update_props_dict = {}
+                if datasets_prop[dataset]['mountpoint']['value'] != 'legacy':
+                    update_props_dict['mountpoint'] = {'value': 'legacy'}
+                if dataset_quota and datasets_prop[dataset]['quota']['value'] != '1G':
+                    update_props_dict['quota'] = {'value': '1G'}
+                if update_props_dict:
+                    await self.middleware.call(
+                        'zfs.dataset.update',
+                        dataset,
+                        {'properties': update_props_dict},
+                    )
         return createdds
 
     async def __mount(self, pool, uuid, path=SYSDATASET_PATH):
@@ -224,38 +332,9 @@ class SystemDatasetService(ConfigService):
         return [(f'{pool}/.system', '')] + [
             (f'{pool}/.system/{i}', i) for i in [
                 'cores', 'samba4', f'syslog-{uuid}',
-                f'rrd-{uuid}', f'configs-{uuid}', 'webui',
+                f'rrd-{uuid}', f'configs-{uuid}', 'webui', 'services'
             ]
         ]
-
-    @private
-    async def rrd_toggle(self):
-        config = await self.config()
-
-        # Path where collectd stores files
-        rrd_path = '/var/db/collectd/rrd'
-        # Path where rrd fies are stored in system dataset
-        rrd_syspath = f'/var/db/system/rrd-{config["uuid"]}'
-
-        if config['rrd']:
-            # Move from tmpfs to system dataset
-            if os.path.exists(rrd_path):
-                if os.path.islink(rrd_path):
-                    # rrd path is already a link
-                    # so there is nothing we can do about it
-                    return False
-                cp = await run('rsync', '-a', f'{rrd_path}/', f'{rrd_syspath}/', check=False)
-                return cp.returncode == 0
-        else:
-            # Move from system dataset to tmpfs
-            if os.path.exists(rrd_path):
-                if os.path.islink(rrd_path):
-                    os.unlink(rrd_path)
-            else:
-                os.makedirs(rrd_path)
-            cp = await run('rsync', '-a', f'{rrd_syspath}/', f'{rrd_path}/')
-            return cp.returncode == 0
-        return False
 
     async def __nfsv4link(self, config):
         syspath = config['path']
@@ -263,7 +342,7 @@ class SystemDatasetService(ConfigService):
             return None
 
         restartfiles = ["/var/db/nfs-stablerestart", "/var/db/nfs-stablerestart.bak"]
-        if not await self.middleware.call('system.is_freenas') and await self.middleware.call('notifier.failover_status') == 'BACKUP':
+        if not await self.middleware.call('system.is_freenas') and await self.middleware.call('failover.status') == 'BACKUP':
             return None
 
         for item in restartfiles:
@@ -307,41 +386,55 @@ class SystemDatasetService(ConfigService):
             open(path, 'w').close()
         os.symlink(path, item)
 
+    @private
     async def migrate(self, _from, _to):
 
         config = await self.config()
 
-        rsyncs = (
-            (SYSDATASET_PATH, '/tmp/system.new'),
-        )
-
-        if not os.path.exists('/tmp/system.new'):
-            os.mkdir('/tmp/system.new')
-
         await self.__setup_datasets(_to, config['uuid'])
-        await self.__mount(_to, config['uuid'], path='/tmp/system.new')
 
-        restart = ['syslogd', 'collectd']
+        if _from:
+            path = '/tmp/system.new'
+            if not os.path.exists('/tmp/system.new'):
+                os.mkdir('/tmp/system.new')
+        else:
+            path = SYSDATASET_PATH
+        await self.__mount(_to, config['uuid'], path=path)
+
+        restart = ['collectd', 'rrdcached', 'syslogd']
 
         if await self.middleware.call('service.started', 'cifs'):
-            restart.append('cifs')
+            restart.insert(0, 'cifs')
 
-        for i in restart:
-            await self.middleware.call('service.stop', i)
+        try:
+            for i in restart:
+                await self.middleware.call('service.stop', i)
 
-        for src, dest in rsyncs:
-            cp = await run('rsync', '-az', f'{src}/', dest)
+            if _from:
+                cp = await run('rsync', '-az', f'{SYSDATASET_PATH}/', '/tmp/system.new', check=False)
+                if cp.returncode == 0:
+                    await self.__umount(_from, config['uuid'])
+                    await self.__umount(_to, config['uuid'])
+                    await self.__mount(_to, config['uuid'], SYSDATASET_PATH)
+                    proc = await Popen(f'zfs list -H -o name {_from}/.system|xargs zfs destroy -r', shell=True)
+                    await proc.communicate()
 
-        if _from and cp.returncode == 0:
-            await self.__umount(_from, config['uuid'])
-            await self.__umount(_to, config['uuid'])
-            await self.__mount(_to, config['uuid'], SYSDATASET_PATH)
-            proc = await Popen(f'zfs list -H -o name {_from}/.system|xargs zfs destroy -r', shell=True)
-            await proc.communicate()
+                os.rmdir('/tmp/system.new')
+        finally:
 
-        os.rmdir('/tmp/system.new')
-
-        for i in restart:
-            await self.middleware.call('service.start', i)
+            restart.reverse()
+            for i in restart:
+                await self.middleware.call('service.start', i)
 
         await self.__nfsv4link(config)
+
+
+async def pool_post_import(middleware, pool):
+    """
+    On pool import we may need to reconfigure system dataset.
+    """
+    await middleware.call('systemdataset.setup')
+
+
+async def setup(middleware):
+    middleware.register_hook('pool.post_import', pool_post_import, sync=True)

@@ -5,12 +5,14 @@ import asyncio
 import base64
 import binascii
 import copy
+import traceback
 import types
 
 from .client import ejson as json
 from .job import Job
+from .pipe import Pipes
 from .schema import Error as SchemaError
-from .service import CallError, ValidationError, ValidationErrors
+from .service_exception import adapt_exception, CallError, ValidationError, ValidationErrors, MatchNotFound
 
 
 async def authenticate(middleware, req):
@@ -28,8 +30,17 @@ async def authenticate(middleware, req):
             raise web.HTTPUnauthorized()
     except web.HTTPUnauthorized:
         raise
-    except Exception as e:
+    except Exception:
         raise web.HTTPUnauthorized()
+
+
+class Application:
+
+    def __init__(self, host, remote_port):
+        self.host = host
+        self.remote_port = remote_port
+        self.websocket = False
+        self.rest = self.authenticated = True
 
 
 class RESTfulAPI(object):
@@ -51,8 +62,8 @@ class RESTfulAPI(object):
         for methodname, method in list((await self.middleware.call('core.get_methods')).items()):
             self._methods[methodname] = method
             self._methods_by_service[methodname.rsplit('.', 1)[0]][methodname] = method
-        for name, service in list((await self.middleware.call('core.get_services')).items()):
 
+        for name, service in list((await self.middleware.call('core.get_services')).items()):
             kwargs = {}
             blacklist_methods = []
             """
@@ -126,6 +137,7 @@ class OpenAPIResource(object):
 
     def __init__(self, rest):
         self.rest = rest
+        self.rest.app.router.add_route('GET', '/api/v2.0', self.get)
         self.rest.app.router.add_route('GET', '/api/v2.0/', self.get)
         self.rest.app.router.add_route('GET', '/api/v2.0/openapi.json', self.get)
         self._paths = defaultdict(dict)
@@ -161,8 +173,16 @@ class OpenAPIResource(object):
             'parameters': [],
         }
         method = self.rest._methods.get(methodname)
-        if method:
+        if method and method.get('require_pipes'):
+            return
+        elif method:
             desc = method.get('description')
+            if method.get('downloadable') or method.get('uploadable'):
+                job_desc = f'\n\nA file can be {"downloaded from" if method.get("downloadable") else "uploaded to"} ' \
+                           'this end point. This end point is special, please refer to Jobs section in ' \
+                           'Websocket API documentation for details.'
+                desc = (desc or '') + job_desc
+
             if desc:
                 opobject['description'] = desc
 
@@ -194,7 +214,7 @@ class OpenAPIResource(object):
                         'schema': {'type': 'string'},
                     },
                 ]
-            elif accepts:
+            elif accepts and not (operation == 'delete' and method['item_method'] and len(accepts) == 1):
                 opobject['requestBody'] = self._accepts_to_request(methodname, method, accepts)
 
             # For now we only accept `id` as an url parameters
@@ -223,6 +243,18 @@ class OpenAPIResource(object):
         if _type == 'object':
             for key, val in schema['properties'].items():
                 schema['properties'][key] = self._convert_schema(val)
+        elif _type == 'array':
+            items = schema.get('items')
+            for i, item in enumerate(list(items)):
+                if item.get('type') == 'null':
+                    items.remove(item)
+            if isinstance(items, list):
+                if len(items) > 1:
+                    schema['items'] = {'oneOf': items}
+                elif len(items) > 0:
+                    schema['items'] = items[0]
+                else:
+                    schema['items'] = {}
         return schema
 
     def _accepts_to_request(self, methodname, method, schemas):
@@ -321,6 +353,7 @@ class Resource(object):
             operation = getattr(self, i)
             if operation is None:
                 continue
+            self.rest.app.router.add_route(i.upper(), f'/api/v2.0/{path}', getattr(self, f'on_{i}'))
             self.rest.app.router.add_route(i.upper(), f'/api/v2.0/{path}/', getattr(self, f'on_{i}'))
             self.rest._openapi.add_path(path, i, operation)
             self.__map_method_params(operation)
@@ -360,7 +393,8 @@ class Resource(object):
 
             async def on_method(req, *args, **kwargs):
                 resp = web.Response()
-                await authenticate(self.middleware, req)
+                if not self.rest._methods[getattr(self, method)]['no_auth_required']:
+                    await authenticate(self.middleware, req)
                 kwargs.update(dict(req.match_info))
                 return await do(method, req, resp, *args, **kwargs)
 
@@ -425,7 +459,7 @@ class Resource(object):
                 val = None
             filters.append((field, op, val))
 
-        return [filters, options]
+        return [filters, options] if filters or options else []
 
     async def do(self, http_method, req, resp, **kwargs):
         assert http_method in ('delete', 'get', 'post', 'put')
@@ -443,7 +477,19 @@ class Resource(object):
         if get_method_args is not None:
             method_args = get_method_args(req, resp, **kwargs)
         else:
-            if http_method in ('post', 'put'):
+            method_args = []
+            if http_method == 'get' and method['filterable']:
+                if self.parent and 'id' in kwargs:
+                    filterid = kwargs['id']
+                    if filterid.isdigit():
+                        filterid = int(filterid)
+                    method_args = [[('id', '=', filterid)], {'get': True}]
+                else:
+                    method_args = self._filterable_args(req)
+
+            if not method_args:
+                # RFC 7231 specifies that a GET request can accept a payload body
+                # This means that all the http methods now ( delete, get, post, put ) accept a payload body
                 try:
                     text = await req.text()
                     if not text:
@@ -451,7 +497,12 @@ class Resource(object):
                     else:
                         data = await req.json()
                         params = self.__method_params.get(methodname)
-                        if not params or len(params) == 1:
+                        if not params and http_method in ('get', 'delete') and not data:
+                            # This will happen when the request body contains empty dict "{}"
+                            # Keeping compatibility with how we used to accept the above case, this
+                            # makes sure that existing client implementations are not affected
+                            method_args = []
+                        elif not params or len(params) == 1:
                             method_args = [data]
                         else:
                             if not isinstance(data, dict):
@@ -463,28 +514,25 @@ class Resource(object):
                             method_args = []
                             for p, options in sorted(params.items(), key=lambda x: x[1]['order']):
                                 if p not in data and options['required']:
+                                    resp.set_status(400)
                                     resp.body = json.dumps({
                                         'message': f'{p} attribute expected.',
                                     })
                                     return resp
                                 elif p in data:
-                                    method_args.append(data[p])
+                                    method_args.append(data.pop(p))
+                            if data:
+                                resp.set_status(400)
+                                resp.body = json.dumps({
+                                    'message': f'The following attributes are not expected: {", ".join(data.keys())}',
+                                })
+                                return resp
                 except Exception as e:
                     resp.set_status(400)
                     resp.body = json.dumps({
                         'message': str(e),
                     })
                     return resp
-            elif http_method == 'get' and method['filterable']:
-                if self.parent and 'id' in kwargs:
-                    filterid = kwargs['id']
-                    if filterid.isdigit():
-                        filterid = int(filterid)
-                    method_args = [[('id', '=', filterid)], {'get': True}]
-                else:
-                    method_args = self._filterable_args(req)
-            else:
-                method_args = []
 
         """
         If the method is marked `item_method` then the first argument
@@ -493,10 +541,21 @@ class Resource(object):
         if method.get('item_method') is True:
             method_args.insert(0, kwargs['id'])
 
+        if method.get('pass_application'):
+            method_kwargs = {
+                'app': Application(req.headers.get('X-Real-Remote-Addr'), req.headers.get('X-Real-Remote-Port'))
+            }
+        else:
+            method_kwargs = {}
+        download_pipe = None
+        if method['downloadable']:
+            download_pipe = self.middleware.pipe()
+            method_kwargs['pipes'] = Pipes(output=download_pipe)
+
         try:
-            result = await self.middleware.call(methodname, *method_args)
+            result = await self.middleware.call(methodname, *method_args, **method_kwargs)
         except CallError as e:
-            resp = web.Response(status=400)
+            resp = web.Response(status=422)
             result = {
                 'message': e.errmsg,
                 'errno': e.errno,
@@ -511,6 +570,48 @@ class Resource(object):
                     'errno': errno,
                 })
             resp = web.Response(status=422)
+
+        except Exception as e:
+            adapted = adapt_exception(e)
+            if adapted:
+                resp = web.Response(status=422)
+                result = {
+                    'message': adapted.errmsg,
+                    'errno': adapted.errno,
+                }
+            else:
+                if isinstance(e, (MatchNotFound,)):
+                    resp = web.Response(status=404)
+                    result = {
+                        'message': str(e),
+                    }
+                else:
+                    resp = web.Response(status=500)
+                    result = {
+                        'message': str(e),
+                        'traceback': ''.join(traceback.format_exc()),
+                    }
+
+        if download_pipe is not None:
+            resp = web.StreamResponse(status=200, reason='OK', headers={
+                'Content-Type': 'application/octet-stream',
+                'Transfer-Encoding': 'chunked',
+            })
+            await resp.prepare(req)
+
+            loop = asyncio.get_event_loop()
+
+            def do_copy():
+                while True:
+                    read = download_pipe.r.read(1048576)
+                    if read == b'':
+                        break
+                    asyncio.run_coroutine_threadsafe(resp.write(read), loop=loop).result()
+
+            await self.middleware.run_in_thread(do_copy)
+
+            await resp.drain()
+            return resp
 
         if isinstance(result, types.GeneratorType):
             result = list(result)

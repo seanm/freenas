@@ -3,18 +3,213 @@
 from collections import defaultdict
 import copy
 from datetime import datetime, timedelta
+from decimal import Decimal
 import os
 import subprocess
-import sys
 import threading
+import time
 
 import libzfs
 import netsnmpagent
 import pysnmp.hlapi  # noqa
 import pysnmp.smi
+import sysctl
 
-sys.path.append("/usr/local/www")
-from freenasUI.tools.arc_summary import get_Kstat, get_arc_efficiency
+from middlewared.client import Client
+
+
+def get_Kstat():
+    Kstats = [
+        "hw.pagesize",
+        "hw.physmem",
+        "kern.maxusers",
+        "vm.kmem_map_free",
+        "vm.kmem_map_size",
+        "vm.kmem_size",
+        "vm.kmem_size_max",
+        "vm.kmem_size_min",
+        "vm.kmem_size_scale",
+        "vm.stats",
+        "vm.swap_total",
+        "vm.swap_reserved",
+        "kstat.zfs",
+        "vfs.zfs"
+    ]
+
+    Kstat = {}
+    for kstat in Kstats:
+        for s in sysctl.filter(kstat):
+            if isinstance(s.value, int):
+                Kstat[s.name] = Decimal(s.value)
+            elif isinstance(s.value, bytearray):
+                Kstat[s.name] = Decimal(int.from_bytes(s.value, "little"))
+
+    return Kstat
+
+
+def get_arc_efficiency(Kstat):
+    output = {}
+
+    if "vfs.zfs.version.spa" not in Kstat:
+        return
+
+    arc_hits = Kstat["kstat.zfs.misc.arcstats.hits"]
+    arc_misses = Kstat["kstat.zfs.misc.arcstats.misses"]
+    demand_data_hits = Kstat["kstat.zfs.misc.arcstats.demand_data_hits"]
+    demand_data_misses = Kstat["kstat.zfs.misc.arcstats.demand_data_misses"]
+    demand_metadata_hits = Kstat[
+        "kstat.zfs.misc.arcstats.demand_metadata_hits"
+    ]
+    demand_metadata_misses = Kstat[
+        "kstat.zfs.misc.arcstats.demand_metadata_misses"
+    ]
+    mfu_ghost_hits = Kstat["kstat.zfs.misc.arcstats.mfu_ghost_hits"]
+    mfu_hits = Kstat["kstat.zfs.misc.arcstats.mfu_hits"]
+    mru_ghost_hits = Kstat["kstat.zfs.misc.arcstats.mru_ghost_hits"]
+    mru_hits = Kstat["kstat.zfs.misc.arcstats.mru_hits"]
+    prefetch_data_hits = Kstat["kstat.zfs.misc.arcstats.prefetch_data_hits"]
+    prefetch_data_misses = Kstat[
+        "kstat.zfs.misc.arcstats.prefetch_data_misses"
+    ]
+    prefetch_metadata_hits = Kstat[
+        "kstat.zfs.misc.arcstats.prefetch_metadata_hits"
+    ]
+    prefetch_metadata_misses = Kstat[
+        "kstat.zfs.misc.arcstats.prefetch_metadata_misses"
+    ]
+
+    anon_hits = arc_hits - (
+        mfu_hits + mru_hits + mfu_ghost_hits + mru_ghost_hits
+    )
+    arc_accesses_total = (arc_hits + arc_misses)
+    demand_data_total = (demand_data_hits + demand_data_misses)
+    prefetch_data_total = (prefetch_data_hits + prefetch_data_misses)
+    real_hits = (mfu_hits + mru_hits)
+
+    output["total_accesses"] = fHits(arc_accesses_total)
+    output["cache_hit_ratio"] = {
+        'per': fPerc(arc_hits, arc_accesses_total),
+        'num': fHits(arc_hits),
+    }
+    output["cache_miss_ratio"] = {
+        'per': fPerc(arc_misses, arc_accesses_total),
+        'num': fHits(arc_misses),
+    }
+    output["actual_hit_ratio"] = {
+        'per': fPerc(real_hits, arc_accesses_total),
+        'num': fHits(real_hits),
+    }
+    output["data_demand_efficiency"] = {
+        'per': fPerc(demand_data_hits, demand_data_total),
+        'num': fHits(demand_data_total),
+    }
+
+    if prefetch_data_total > 0:
+        output["data_prefetch_efficiency"] = {
+            'per': fPerc(prefetch_data_hits, prefetch_data_total),
+            'num': fHits(prefetch_data_total),
+        }
+
+    if anon_hits > 0:
+        output["cache_hits_by_cache_list"] = {}
+        output["cache_hits_by_cache_list"]["anonymously_used"] = {
+            'per': fPerc(anon_hits, arc_hits),
+            'num': fHits(anon_hits),
+        }
+
+    output["most_recently_used"] = {
+        'per': fPerc(mru_hits, arc_hits),
+        'num': fHits(mru_hits),
+    }
+    output["most_frequently_used"] = {
+        'per': fPerc(mfu_hits, arc_hits),
+        'num': fHits(mfu_hits),
+    }
+    output["most_recently_used_ghost"] = {
+        'per': fPerc(mru_ghost_hits, arc_hits),
+        'num': fHits(mru_ghost_hits),
+    }
+    output["most_frequently_used_ghost"] = {
+        'per': fPerc(mfu_ghost_hits, arc_hits),
+        'num': fHits(mfu_ghost_hits),
+    }
+
+    output["cache_hits_by_data_type"] = {}
+    output["cache_hits_by_data_type"]["demand_data"] = {
+        'per': fPerc(demand_data_hits, arc_hits),
+        'num': fHits(demand_data_hits),
+    }
+    output["cache_hits_by_data_type"]["prefetch_data"] = {
+        'per': fPerc(prefetch_data_hits, arc_hits),
+        'num': fHits(prefetch_data_hits),
+    }
+    output["cache_hits_by_data_type"]["demand_metadata"] = {
+        'per': fPerc(demand_metadata_hits, arc_hits),
+        'num': fHits(demand_metadata_hits),
+    }
+    output["cache_hits_by_data_type"]["prefetch_metadata"] = {
+        'per': fPerc(prefetch_metadata_hits, arc_hits),
+        'num': fHits(prefetch_metadata_hits),
+    }
+
+    output["cache_misses_by_data_type"] = {}
+    output["cache_misses_by_data_type"]["demand_data"] = {
+        'per': fPerc(demand_data_misses, arc_misses),
+        'num': fHits(demand_data_misses),
+    }
+    output["cache_misses_by_data_type"]["prefetch_data"] = {
+        'per': fPerc(prefetch_data_misses, arc_misses),
+        'num': fHits(prefetch_data_misses),
+    }
+    output["cache_misses_by_data_type"]["demand_metadata"] = {
+        'per': fPerc(demand_metadata_misses, arc_misses),
+        'num': fHits(demand_metadata_misses),
+    }
+    output["cache_misses_by_data_type"]["prefetch_metadata"] = {
+        'per': fPerc(prefetch_metadata_misses, arc_misses),
+        'num': fHits(prefetch_metadata_misses),
+    }
+
+    return output
+
+
+def fHits(Hits=0, Decimal=2):
+    khits = (10 ** 3)
+    mhits = (10 ** 6)
+    bhits = (10 ** 9)
+    thits = (10 ** 12)
+    qhits = (10 ** 15)
+    Qhits = (10 ** 18)
+    shits = (10 ** 21)
+    Shits = (10 ** 24)
+
+    if Hits >= Shits:
+        return str("%0." + str(Decimal) + "f") % (Hits / Shits) + "S"
+    elif Hits >= shits:
+        return str("%0." + str(Decimal) + "f") % (Hits / shits) + "s"
+    elif Hits >= Qhits:
+        return str("%0." + str(Decimal) + "f") % (Hits / Qhits) + "Q"
+    elif Hits >= qhits:
+        return str("%0." + str(Decimal) + "f") % (Hits / qhits) + "q"
+    elif Hits >= thits:
+        return str("%0." + str(Decimal) + "f") % (Hits / thits) + "t"
+    elif Hits >= bhits:
+        return str("%0." + str(Decimal) + "f") % (Hits / bhits) + "b"
+    elif Hits >= mhits:
+        return str("%0." + str(Decimal) + "f") % (Hits / mhits) + "m"
+    elif Hits >= khits:
+        return str("%0." + str(Decimal) + "f") % (Hits / khits) + "k"
+    elif Hits == 0:
+        return str("%d" % 0)
+    else:
+        return str("%d" % Hits)
+
+
+def fPerc(lVal=0, rVal=0, Decimal=2):
+    if rVal > 0:
+        return str("%0." + str(Decimal) + "f") % (100 * (lVal / rVal)) + "%"
+    else:
+        return str("%0." + str(Decimal) + "f") % 100 + "%"
 
 
 def calculate_allocation_units(*args):
@@ -44,11 +239,14 @@ mib_builder = pysnmp.smi.builder.MibBuilder()
 mib_sources = mib_builder.getMibSources() + (pysnmp.smi.builder.DirMibSource("/usr/local/share/pysnmp/mibs"),)
 mib_builder.setMibSources(*mib_sources)
 mib_builder.loadModules("FREENAS-MIB")
+mib_builder.loadModules("LM-SENSORS-MIB")
 zpool_health_type = mib_builder.importSymbols("FREENAS-MIB", "ZPoolHealthType")[0]
 
 agent = netsnmpagent.netsnmpAgent(
     AgentName="FreeNASAgent",
-    MIBFiles=["/usr/local/share/snmp/mibs/FREENAS-MIB.txt"],
+    MIBFiles=[
+        "/usr/local/share/snmp/mibs/FREENAS-MIB.txt", "/usr/local/share/snmp/mibs/LM-SENSORS-MIB.txt"
+    ],
 )
 
 zpool_table = agent.Table(
@@ -100,6 +298,17 @@ zvol_table = agent.Table(
         (5, agent.Integer32()),
         (6, agent.Integer32()),
     ],
+)
+
+temp_sensors_table = agent.Table(
+    oidstr="LM-SENSORS-MIB::lmTempSensorsTable",
+    indexes=[
+        agent.Integer32(),
+    ],
+    columns=[
+        (2, agent.DisplayString()),
+        (3, agent.Unsigned32()),
+    ]
 )
 
 zfs_arc_size = agent.Unsigned32(oidstr="FREENAS-MIB::zfsArcSize")
@@ -207,20 +416,109 @@ class ZilstatThread(threading.Thread):
             self.value = value
 
 
+class CpuTempThread(threading.Thread):
+    def __init__(self, interval):
+        super().__init__()
+
+        self.daemon = True
+
+        self.interval = interval
+        self.temperatures = []
+
+        self.numcpu = 0
+        try:
+            self.numcpu = int(sysctl.filter("hw.ncpu")[0].value)
+        except Exception as e:
+            print(f"Failed to get CPU count: {e!r}")
+
+    def run(self):
+        if not self.numcpu:
+            return 0
+
+        while True:
+            temperatures = []
+            try:
+                for i in range(self.numcpu):
+                    raw_temperature = int(sysctl.filter(f"dev.cpu.{i}.temperature")[0].value)
+                    temperatures.append((raw_temperature - 2732) * 100)
+            except Exception as e:
+                print(f"Failed to get CPU temperature: {e!r}")
+                temperatures = []
+
+            self.temperatures = temperatures
+
+            time.sleep(self.interval)
+
+
+class DiskTempThread(threading.Thread):
+    def __init__(self, interval):
+        super().__init__()
+
+        self.daemon = True
+
+        self.interval = interval
+        self.temperatures = {}
+
+        self.initialized = False
+        self.disks = []
+        self.powermode = None
+
+    def run(self):
+        while True:
+            if not self.initialized:
+                try:
+                    with Client() as c:
+                        self.disks = c.call("disk.disks_for_temperature_monitoring")
+                        self.powermode = c.call("smart.config")["powermode"]
+                except Exception as e:
+                    print(f"Failed to query disks for temperature monitoring: {e!r}")
+                else:
+                    self.initialized = True
+
+            if not self.initialized:
+                time.sleep(self.interval)
+                continue
+
+            if not self.disks:
+                return
+
+            try:
+                with Client() as c:
+                    self.temperatures = {
+                        disk: temperature
+                        for disk, temperature in c.call("disk.temperatures", self.disks, self.powermode).items()
+                        if temperature is not None
+                    }
+            except Exception as e:
+                print(f"Failed to collect disks temperatures: {e!r}")
+                self.temperatures = {}
+
+            time.sleep(self.interval)
+
+
 if __name__ == "__main__":
+    with Client() as c:
+        config = c.call("snmp.config")
+
     zfs = libzfs.ZFS()
 
     zpool_io_thread = ZpoolIoThread()
     zpool_io_thread.start()
 
     zilstat_1_thread = ZilstatThread(1)
-    zilstat_1_thread.start()
-
     zilstat_5_thread = ZilstatThread(5)
-    zilstat_5_thread.start()
-
     zilstat_10_thread = ZilstatThread(10)
-    zilstat_10_thread.start()
+
+    if config["zilstat"]:
+        zilstat_1_thread.start()
+        zilstat_5_thread.start()
+        zilstat_10_thread.start()
+
+    cpu_temp_thread = CpuTempThread(10)
+    cpu_temp_thread.start()
+
+    disk_temp_thread = DiskTempThread(300)
+    disk_temp_thread.start()
 
     agent.start()
 
@@ -304,6 +602,16 @@ if __name__ == "__main__":
                 row.setRowCell(5, agent.Integer32(used))
                 row.setRowCell(6, agent.Integer32(available))
 
+            temp_sensors_table.clear()
+            temperatures = []
+            for i, temp in enumerate(cpu_temp_thread.temperatures.copy()):
+                temperatures.append((f"CPU{i}", temp))
+            temperatures.extend(list(disk_temp_thread.temperatures.items()))
+            for i, (name, temp) in enumerate(temperatures):
+                row = temp_sensors_table.addRow([agent.Integer32(i + 1)])
+                row.setRowCell(2, agent.DisplayString(name))
+                row.setRowCell(3, agent.Unsigned32(temp))
+
             last_update_at = datetime.utcnow()
 
             kstat = get_Kstat()
@@ -324,7 +632,7 @@ if __name__ == "__main__":
             zfs_l2arc_misses.update(int(kstat["kstat.zfs.misc.arcstats.l2_misses"] % 2 ** 32))
             zfs_l2arc_read.update(int(kstat["kstat.zfs.misc.arcstats.l2_read_bytes"] / 1024 % 2 ** 32))
             zfs_l2arc_write.update(int(kstat["kstat.zfs.misc.arcstats.l2_write_bytes"] / 1024 % 2 ** 32))
-            zfs_l2arc_size.update(int(kstat["kstat.zfs.misc.arcstats.l2_size"] / 1024))
+            zfs_l2arc_size.update(int(kstat["kstat.zfs.misc.arcstats.l2_asize"] / 1024))
 
             zfs_zilstat_ops1.update(zilstat_1_thread.value["ops"])
             zfs_zilstat_ops5.update(zilstat_5_thread.value["ops"])

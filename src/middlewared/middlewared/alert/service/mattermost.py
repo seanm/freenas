@@ -1,7 +1,7 @@
 import json
 import requests
 
-from middlewared.alert.base import ThreadedAlertService, format_alerts
+from middlewared.alert.base import ThreadedAlertService
 from middlewared.schema import Dict, Str
 
 
@@ -10,12 +10,11 @@ class MattermostAlertService(ThreadedAlertService):
 
     schema = Dict(
         "mattermost_attributes",
-        Str("cluster_name"),
-        Str("url"),
-        Str("username"),
-        Str("password"),
-        Str("team"),
-        Str("channel"),
+        Str("url", required=True, empty=False),
+        Str("username", required=True, empty=False),
+        Str("channel", default=""),
+        Str("icon_url", default=""),
+        strict=True,
     )
 
     def send_sync(self, alerts, gone_alerts, new_alerts):
@@ -23,9 +22,10 @@ class MattermostAlertService(ThreadedAlertService):
             self.attributes["url"],
             headers={"Content-type": "application/json"},
             data=json.dumps({
-                "channel": self.attributes["channel"],
                 "username": self.attributes["username"],
-                "text": format_alerts(alerts, gone_alerts, new_alerts),
+                "channel": self.attributes["channel"],
+                "icon_url": self.attributes["icon_url"],
+                "text": self._format_alerts(alerts, gone_alerts, new_alerts),
             }),
             timeout=15,
         )

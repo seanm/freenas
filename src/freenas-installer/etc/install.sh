@@ -12,21 +12,85 @@ export TERM
 
 . /etc/avatar.conf
 
+# Boot Pool
+BOOT_POOL="boot-pool"
+NEW_BOOT_POOL="boot-pool"
+
+# Constants for base 10 and base 2 units
+: ${kB:=$((1000))}      ${kiB:=$((1024))};       readonly kB kiB
+: ${MB:=$((1000 * kB))} ${MiB:=$((1024 * kiB))}; readonly MB MiB
+: ${GB:=$((1000 * MB))} ${GiB:=$((1024 * MiB))}; readonly GB GiB
+: ${TB:=$((1000 * GB))} ${TiB:=$((1024 * GiB))}; readonly TB TiB
+
 is_truenas()
 {
-
-    test "$AVATAR_PROJECT" = "TrueNAS"
-    return $?
+	dmidecode -s system-product-name | grep -qi "truenas"
+	return $?
 }
 
-do_sata_dom()
-{
+# Constant media size threshold for allowing swap partitions.
+: ${MIN_SWAPSAFE_MEDIASIZE:=$((60 * GB))}; readonly MIN_SWAPSAFE_MEDIASIZE
 
-    if ! is_truenas ; then
-	return 1
+# Check if it is safe to create swap partitions on the given disks.
+#
+# The result can be forced by setting SWAP_IS_SAFE in the environment to either
+# "YES" or "NO".
+#
+# Sets SWAP_IS_SAFE to "YES" if
+#   we are on TrueNAS
+#   *or*
+#   every disk in $@ is >= ${MIN_SWAPSAFE_MEDIASIZE} and none is USB and user says ok
+# Otherwise sets SWAP_IS_SAFE to "NO".
+#
+# Use `is_swap_safe` to check the value of ${SWAP_IS_SAFE}.
+check_is_swap_safe()
+{
+    # We assume swap is safe on TrueNAS,
+    # and we try to use the existing value for ${SWAP_IS_SAFE} if already set.
+    if ! is_truenas && [ -z "${SWAP_IS_SAFE}" ] ; then
+	local _disk
+	# Check every disk in $@, aborting if an unsafe disk is found.
+	for _disk ; do
+	    if [ $(diskinfo "${_disk}" | cut -f 3) -lt ${MIN_SWAPSAFE_MEDIASIZE} ] ||
+		camcontrol negotiate "${_disk}" -v | grep -qF 'umass-sim' ; then
+		SWAP_IS_SAFE="NO"
+		break
+	    fi
+	done
     fi
-    install_sata_dom_prompt
-    return $?
+    # Make sure we have a valid value for ${SWAP_IS_SAFE}.
+    # If unset, we are either on TrueNAS or didn't find an unsafe disk.
+    case "${SWAP_IS_SAFE:="YES"}" in
+	# Accept YES or NO (case-insensitive).
+	[Yy][Ee][Ss])
+	    # Confirm swap setup
+	    if ! is_truenas &&
+		! dialog --clear --title "${AVATAR_PROJECT}" \
+		    --yes-label "Create swap" --no-label "No swap" --yesno  \
+		    "Create 16GB swap partition on boot devices?" \
+		    7 74 ; then
+		SWAP_IS_SAFE="NO"
+	    fi
+	    ;;
+	[Nn][Oo]) ;;
+	# Reject other values.
+	*)  echo "Ignoring invalid value for SWAP_IS_SAFE: ${SWAP_IS_SAFE}"
+	    unset SWAP_IS_SAFE
+	    check_is_swap_safe "$@"
+	    ;;
+    esac
+    export SWAP_IS_SAFE
+}
+
+# A specialized checkyesno for SWAP_IS_SAFE.
+# Returns 0 if it is ok to set up swap on the chosen disks, otherwise 1.
+# `check_is_swap_safe` must be called once before calling `is_swap_safe`.
+is_swap_safe()
+{
+    case "${SWAP_IS_SAFE:?}" in
+	[Yy][Ee][Ss]) true;;
+	*) false;;
+    esac
 }
 
 get_product_path()
@@ -46,18 +110,18 @@ get_image_name()
 # This does memory size only for now.
 pre_install_check()
 {
-    # We need at least this many GB of RAM
-    local readonly minmemgb=8
-    # subtract 1GB to allow for reserved memory
-    local readonly minmem=$(expr \( ${minmemgb} \- 1 \) \* 1024 \* 1024 \* 1024)
+    # We need at least 8 GB of RAM
+    # minus 1 GB to allow for reserved memory
+    local minmem=$((7 * GiB))
     local memsize=$(sysctl -n hw.physmem)
 
     if [ ${memsize} -lt ${minmem} ]; then
 	dialog --clear --title "${AVATAR_PROJECT}" --defaultno \
-	--yesno "This computer has less than the recommended ${minmemgb} GB of RAM.\n\nOperation without enough RAM is not recommended.  Continue anyway?" 7 74 || return 1
+	--yesno "This computer has less than the recommended 8 GB of RAM.\n\nOperation without enough RAM is not recommended.  Continue anyway?" 7 74 || return 1
     fi
     return 0
 }
+
 # Convert /etc/version* to /etc/avatar.conf
 #
 # 1 - old /etc/version* file
@@ -89,53 +153,6 @@ upgrade_version_to_avatar_conf()
     mv $destconf.$$ $destconf
 }
 
-build_config_old()
-{
-    # build_config ${_disk} ${_image} ${_config_file}
-
-    local _disk=$1
-    local _image=$2
-    local _config_file=$3
-
-    cat << EOF > "${_config_file}"
-# Added to stop pc-sysinstall from complaining
-installMode=fresh
-installInteractive=no
-installType=FreeBSD
-installMedium=dvd
-packageType=tar
-
-disk0=${_disk}
-partition=image
-image=${_image}
-bootManager=bsd
-commitDiskPart
-EOF
-}
-build_config()
-{
-    # build_config ${_disk} ${_image} ${_config_file}
-
-    local _disk=$1
-    local _image=$2
-    local _config_file=$3
-
-    cat << EOF > "${_config_file}"
-# Added to stop pc-sysinstall from complaining
-installMode=fresh
-installInteractive=no
-installType=FreeBSD
-installMedium=dvd
-packageType=tar
-
-disk0=${_disk}
-partscheme=GPT
-partition=all
-bootManager=bsd
-commitDiskPart
-EOF
-}
-
 wait_keypress()
 {
     local _tmp
@@ -144,7 +161,6 @@ wait_keypress()
 
 sort_disklist()
 {
-
     sed 's/\([^0-9]*\)/\1 /' | sort +0 -1 +1n | tr -d ' '
 }
 
@@ -166,7 +182,7 @@ get_raid_present()
 
 get_physical_disks_list()
 {
-    local _boot=$(glabel status | awk ' /iso9660\/(Free|True)NAS/ { print $3;}')
+    local _boot=$(glabel status | awk '/iso9660\/(FREE|TRUE)NAS/ { print $3 }')
     local _disk
 
     for _disk in $(sysctl -n kern.disks)
@@ -193,27 +209,30 @@ get_media_description()
     local _cap
 
     _media=$1
-    VAL=""
     if [ -n "${_media}" ]; then
 	_description=`geom disk list ${_media} 2>/dev/null \
 	    | sed -ne 's/^   descr: *//p'`
-	if [ -z "$_description" ] ; then
-		_description="Unknown Device"
+	if [ -z "${_description}" ]; then
+	    _description="Unknown Device"
 	fi
-        _cap=`diskinfo ${_media} | awk '{
-            capacity = $3;
-            if (capacity >= 1099511627776) {
-                printf("%.1f TiB", capacity / 1099511627776.0);
-            } else if (capacity >= 1073741824) {
-                printf("%.1f GiB", capacity / 1073741824.0);
-            } else if (capacity >= 1048576) {
-                printf("%.1f MiB", capacity / 1048576.0);
-            } else {
-                printf("%d Bytes", capacity);
-        }}'`
-        VAL="${_description} -- ${_cap}"
+	_cap=`diskinfo ${_media} | awk \
+	    -v TiB=${TiB}.0 \
+	    -v GiB=${GiB}.0 \
+	    -v MiB=${MiB}.0 \
+	'{
+	    capacity = int($3);
+	    if (capacity >= TiB) {
+	        printf("%.1f TiB", capacity / TiB);
+	    } else if (capacity >= GiB) {
+	        printf("%.1f GiB", capacity / GiB);
+	    } else if (capacity >= MiB) {
+	        printf("%.1f MiB", capacity / MiB);
+	    } else {
+	        printf("%d Bytes", capacity);
+	    }
+	}'`
+	echo "${_description} -- ${_cap}"
     fi
-    export VAL
 }
 
 disk_is_mounted()
@@ -229,7 +248,6 @@ disk_is_mounted()
     done
     return 1
 }
-
 
 new_install_verify()
 {
@@ -262,7 +280,7 @@ EOD
     _msg=`cat "${_tmpfile}"`
     rm -f "${_tmpfile}"
     dialog --clear --title "$AVATAR_PROJECT ${_type}" --yesno "${_msg}" 13 74
-    [ $? -eq 0 ] || exit 1
+    [ $? -eq 0 ] || abort
 }
 
 ask_upgrade()
@@ -314,22 +332,21 @@ EOD
     return $?
 }
 
-install_loader() {
+install_loader()
+{
     local _disk _disks
     local _mnt
 
     _mnt="$1"
     shift
-    disks="$*"
-
+    _disks="$*"
 
     # When doing inplace upgrades, its entirely possible we've
     # booted in the wrong mode (I.E. bios/efi)
     # Default to re-stamping what was already used on the current install
     _boottype="$BOOTMODE"
     if [ "${_upgrade_type}" = "inplace" ] ; then
-       glabel list | grep -q 'efibsd'
-      if [ $? -eq 0 ] ; then
+      if gpart show ${_disks} | grep -qF 'efi' ; then
          _boottype="UEFI"
       else
          _boottype="BIOS"
@@ -342,9 +359,10 @@ install_loader() {
 	    echo "Stamping EFI loader on: ${_disk}"
 	    mkdir -p /tmp/efi
 	    mount -t msdosfs /dev/${_disk}p1 /tmp/efi
-	    # Copy the .efi file
+	    # Copy the .efi file and create a fallback startup script
 	    mkdir -p /tmp/efi/efi/boot
 	    cp ${_mnt}/boot/boot1.efi /tmp/efi/efi/boot/BOOTx64.efi
+	    echo "BOOTx64.efi" > /tmp/efi/efi/boot/startup.nsh
 	    umount /tmp/efi
 	else
 	    echo "Stamping GPT loader on: ${_disk}"
@@ -356,7 +374,8 @@ install_loader() {
     return 0
 }
 
-save_serial_settings() {
+save_serial_settings()
+{
     _mnt="$1"
 
     # If the installer was booted with serial mode enabled, we should
@@ -388,7 +407,8 @@ save_serial_settings() {
     fi
 }
 
-mount_disk() {
+mount_disk()
+{
 	local _mnt
 
 	if [ $# -ne 1 ]; then
@@ -397,24 +417,35 @@ mount_disk() {
 
 	_mnt="$1"
 	mkdir -p "${_mnt}"
-	mount -t zfs -o noatime freenas-boot/ROOT/${BENAME} ${_mnt}
+	mount -t zfs -o noatime ${BOOT_POOL}/ROOT/${BENAME} ${_mnt}
 	mkdir -p ${_mnt}/data
 	return 0
 }
 
-create_partitions() {
-    local _disk="$1"
-    local _size=""
+clear_pool_label()
+{
+    local _part=$1
 
-    if [ $# -eq 2 ]; then
-	_size="-s $2"
+    zpool labelclear -f /dev/${_part} 2>/dev/null || true
+}
+
+create_partitions()
+{
+    local _disk="$1"
+    local _size="$2"
+
+    if [ -n "${_size}" ]; then
+	# Round ZFS partition size down to a multiple of 16 MiB (2^24),
+	# leaving units in MiB (2^20).
+	_size="-s $(( (_size >> 24) << 4 ))m"
     fi
-    if gpart create -s GPT -f active ${_disk}; then
+    if gpart create -s GPT ${_disk}; then
 	if [ "$BOOTMODE" = "UEFI" ] ; then
 	  # EFI Mode
 	  sysctl kern.geom.debugflags=16
 	  sysctl kern.geom.label.disk_ident.enable=0
 	  if gpart add -s 260m -t efi ${_disk}; then
+	    clear_pool_label ${_disk}p1
 	    if ! newfs_msdos -F 16 /dev/${_disk}p1 ; then
 	      return 1
 	    fi
@@ -424,272 +455,215 @@ create_partitions() {
           if ! gpart add -t freebsd-boot -i 1 -s 512k ${_disk}; then
 	    return 1
 	  fi
+	  clear_pool_label ${_disk}p1
 	fi
 
-	if is_truenas; then
-	    gpart add -t freebsd-swap -s 16g -i 3 ${_disk}
+	if is_swap_safe; then
+	    gpart add -t freebsd-swap -a 4k -s 16g -i 3 ${_disk}
+	    clear_pool_label ${_disk}p3
 	fi
 	if gpart add -t freebsd-zfs -a 4k -i 2 ${_size} ${_disk}; then
+	    clear_pool_label ${_disk}p2
 	    return 0
 	fi
     fi
-
     return 1
 }
 
-get_minimum_size() {
+get_minimum_size()
+{
     local _min=0
     local _disk
     local _size
-    # We use 1mbyte because the fat16 partition is 512k,
-    # and there's some header space.
-    # Now we use 8MBytes because gpart and some thumb drives
-    # misbehave.
-    local _m1=$(expr 1024 \* 1024 \* 8)
-    # If we decide we want to round it down,
-    # set this to the size (eg, 256 * 1024 * 1024)
-    local _round=0
-    local _g16=$(expr 16 \* 1024 \* 1024 \* 1024)
 
     for _disk
     do
 	_size=""
 	if create_partitions ${_disk} 1>&2; then
-	    _size=$(diskinfo /dev/${_disk}p2 | awk '{print $3;}')
+	    _size=$(diskinfo ${_disk}p2 | cut -f 3)
+	    gmirror destroy -f swap || true
 	    gpart destroy -F ${_disk} 1>&2
 	fi
 	if [ -z "${_size}" ]; then
 	    echo "Could not do anything with ${_disk}, skipping" 1>&2
 	    continue
 	fi
-	if [ ${_round} -gt 0 ]; then
-	    _size=$(expr \( ${_size} / ${_round} \) \* ${_round})
-	fi
-	_size=$(expr ${_size} / 1024)
 	if [ ${_min} -eq 0 -o ${_size} -lt ${_min} ]; then
 	    _min=${_size}
 	fi
     done
-    echo ${_min}k
+
+    echo ${_min}
 }
 
-partition_disk() {
-	local _disks _disksparts
-	local _mirror
-	local _minsize
+# Minimum required space for an installation.
+# Docs state 8 GiB is the bare minimum, but we specify 8 GB here for wiggle room.
+# That should leave enough slop for alignment, boot partition, etc.
+: ${MIN_ZFS_PARTITION_SIZE:=$((8 * GB))}; readonly MIN_ZFS_PARTITION_SIZE
 
-	_disks=$*
-
-	if is_truenas; then
-		gmirror destroy -f swap || true
-	fi
-	# Erase both typical metadata area.
-	for _disk in ${_disks}; do
-	    gpart destroy -F ${_disk} >/dev/null 2>&1 || true
-	    dd if=/dev/zero of=/dev/${_disk} bs=1m count=2 >/dev/null
-	    dd if=/dev/zero of=/dev/${_disk} bs=1m oseek=$(diskinfo /dev/${_disk} | awk '{print int($3/(1024*1024))-2;}') >/dev/null || true
-	done
-
-	_minsize=$(get_minimum_size ${_disks})
-
-	if [ "${_minsize}" = "0k" ]; then
-	    echo "Disk is too small to install ${AVATAR_PROJECT}" 1>&2
-	    return 1
-	fi
-
-	_disksparts=$(for _disk in ${_disks}; do
-	    create_partitions ${_disk} ${_minsize} >&2
-	    if [ "$BOOTMODE" != "UEFI" ] ; then
-	      # Make the disk active
-	      gpart set -a active ${_disk} >&2
-	    fi
-
-	    echo ${_disk}p2
-	done)
-
-	if [ $# -gt 1 ]; then
-	    _mirror="mirror"
-	else
-	    _mirror=""
-	fi
-	zpool create -f -o cachefile=/tmp/zpool.cache -o version=28 -O mountpoint=none -O atime=off -O canmount=off freenas-boot ${_mirror} ${_disksparts}
-	zpool set feature@async_destroy=enabled freenas-boot
-	zpool set feature@empty_bpobj=enabled freenas-boot
-	zpool set feature@lz4_compress=enabled freenas-boot
-	zfs set compress=lz4 freenas-boot
-	zfs create -o canmount=off freenas-boot/ROOT
-	zfs create -o mountpoint=legacy freenas-boot/ROOT/${BENAME}
-
-	return 0
-}
-
-make_swap()
+partition_disks()
 {
-    local _swapparts
+    local _disks _disksparts
+    local _mirror
+    local _minsize
+    local _size
 
-    # Skip the swap creation if installing into a BE (Swap already exists in that case)
-    if [ "${_upgrade_type}" != "inplace" ] ; then
-      _swapparts=$(for _disk in $*; do echo ${_disk}p3; done)
-      gmirror destroy -f swap || true
-      gmirror label -b prefer swap ${_swapparts}
+    _disks=$*
+
+    check_is_swap_safe ${_disks}
+
+    gmirror destroy -f swap || true
+
+    # Erase both typical metadata area.
+    for _disk in ${_disks}; do
+	gpart destroy -F ${_disk} >/dev/null 2>&1 || true
+	dd if=/dev/zero of=/dev/${_disk} bs=1m count=2 >/dev/null
+	_size=$(diskinfo ${_disk} | cut -f 3)
+	dd if=/dev/zero of=/dev/${_disk} bs=1m oseek=$((_size / MiB - 2)) >/dev/null || true
+    done
+
+    _minsize=$(get_minimum_size ${_disks})
+
+    if [ ${_minsize} -lt ${MIN_ZFS_PARTITION_SIZE} ]; then
+	echo "Disk is too small to install ${AVATAR_PROJECT}" 1>&2
+	return 1
     fi
-    echo "/dev/mirror/swap.eli		none			swap		sw		0	0" > /tmp/data/data/fstab.swap
+
+    _disksparts=$(for _disk in ${_disks}; do
+	create_partitions ${_disk} ${_minsize} >&2
+	if [ "$BOOTMODE" != "UEFI" ] ; then
+	    # Make the disk active
+	    gpart set -a active ${_disk} >&2
+	fi
+	echo ${_disk}p2
+    done)
+
+    if [ $# -gt 1 ]; then
+	_mirror="mirror"
+    else
+	_mirror=""
+    fi
+    # Regardless of upgrade/fresh installation, if we are creating a new pool, it's going to be named after value of NEW_BOOT_POOL
+    BOOT_POOL=${NEW_BOOT_POOL}
+    zpool create -f -o cachefile=/tmp/zpool.cache -O mountpoint=none -O atime=off -O canmount=off ${BOOT_POOL} ${_mirror} ${_disksparts}
+    zfs set compression=on ${BOOT_POOL}
+    zfs create -o canmount=off ${BOOT_POOL}/ROOT
+    zfs create -o mountpoint=legacy ${BOOT_POOL}/ROOT/${BENAME}
+
+    return 0
+}
+
+get_disk_pool_guid()
+{
+    local disk=$1
+    local part="/dev/${disk}p2"
+
+    zdb -l ${part} | awk '/pool_guid:/ { print $2; exit }'
+}
+
+# Preserve a copy of an existing FreeNAS install, assumed to be
+# mounted at /tmp/data_old.
+preserve_data()
+{
+    local i
+
+    cp -pR /tmp/data_old/data/. /tmp/data_preserved
+
+    # Don't want to keep the old pkgdb around, since we're
+    # nuking the filesystem
+    rm -rf /tmp/data_preserved/pkgdb
+
+    if [ -d /tmp/data_old/root/.ssh ]; then
+	cp -pR /tmp/data_old/root/.ssh /tmp/
+    fi
+
+    if [ -d /tmp/data_old/usr/local/fusionio ]; then
+	cp -pR /tmp/data_old/usr/local/fusionio /tmp/
+    fi
+
+    if [ -d /tmp/data_old/boot/modules ]; then
+	mkdir -p /tmp/modules
+	for i in `ls /tmp/data_old/boot/modules`
+	do
+	    cp -p /tmp/data_old/boot/modules/$i /tmp/modules/
+	done
+    fi
+
+    if [ -f /tmp/data_old/conf/base/etc/hostid ]; then
+	cp -p /tmp/data_old/conf/base/etc/hostid /tmp/
+    fi
+
+    if [ -f /tmp/data_old/boot.config ]; then
+	cp /tmp/data_old/boot.config /tmp/
+    fi
+
+    if [ -f /tmp/data_old/boot/loader.conf.local ]; then
+	cp /tmp/data_old/boot/loader.conf.local /tmp/
+    fi
+
+    return 0
 }
 
 disk_is_freenas()
 {
-    local _disk="$1"
-    local _rv=1
-    local upgrade_style=""
-    local os_part=""
-    local data_part=""
+    local disk="$1"
+    local part="/dev/${disk}p2"
+    local pool_guid=""
+    local boot_env=""
 
-    # We have two kinds of potential upgrades here.
-    # The old kind, with 4 slices, and the new kind,
-    # with two partitions.
+    # Old style upgrades are no longer supported.
+    if [ -c /dev/${disk}s4 ]; then
+	return 1
+    fi
+
+    # Make sure this is a FreeNAS boot pool.
+    local disk_data=$(zdb -l ${part})
+    echo ${disk_data} | grep -qF "name: '${BOOT_POOL}'"
+    if [ $? -eq 1 ]; then
+        echo ${disk_data} | grep -qF "name: 'freenas-boot'" || return 1
+        BOOT_POOL="freenas-boot"
+    fi
+
+    # Import the pool by GUID in case there are multiple ${BOOT_POOL} pools.
+    pool_guid=$(get_disk_pool_guid ${disk})
+    zpool import -N -f ${pool_guid} || return 1
+
+    # We could give the user a list of the boot environments to choose from,
+    # but for now we just use the active boot environment for the pool.
+    boot_env=$(zpool get -Ho value bootfs ${BOOT_POOL})
+    if [ -z "${boot_env}" ]; then
+	zpool export ${BOOT_POOL} || true
+	return 1
+    fi
 
     mkdir -p /tmp/data_old
-    if [ -c /dev/${_disk}s4 ]; then
-	os_part=/dev/${_disk}s1a
-	data_part=/dev/${_disk}s4
-	upgrade_style="old"
-    elif [ -c /dev/${_disk}p2 ]; then
-	os_part=/dev/${_disk}p2
-	upgrade_style="new"
-    else
+    mount -t zfs "${boot_env}" /tmp/data_old
+    if [ $? != 0 ]; then
+	zpool export ${BOOT_POOL} || true
 	return 1
     fi
 
-    if [ "${upgrade_style}" = "new" ]; then
-	# This code is very clumsy.  There
-	# should be a way to structure it such that
-	# all of the cleanup happens as we want it to.
-	if zdb -l ${os_part} | grep "name: 'freenas-boot'" > /dev/null ; then
-	    :
-	else
-	    return 1
-	fi
-	zpool import -N -f freenas-boot || return 1
-	# Now we want to figure out which dataset to use.
-	DS=$(zpool list -H -o bootfs freenas-boot | head -n 1 | cut -d '/' -f 3)
-	if [ -z "$DS" ] ; then
-	    zpool export freenas-boot || true
-	    return 1
-	fi
-	# There should always be a "set default=" line in a grub.cfg
-	# that we created.
-        if [ -n "${DS}" ]; then
-    	   # Okay, mount this pool
-	   if mount -t zfs freenas-boot/ROOT/"${DS}" /tmp/data_old; then
-		    # If the active dataset doesn't have a database file,
-		    # then it's not FN as far as we're concerned (the upgrade code
-		    # will go badly).
-		    # We also check for the Corral database directory.
-		    if [ ! -f /tmp/data_old/data/freenas-v1.db -o \
-			   -d /tmp/data_old/data/freenas.db ]; then
-			umount /tmp/data_old || true
-			zpool export freenas-boot || true
-			return 1
-		    fi
-		    cp -pR /tmp/data_old/data/. /tmp/data_preserved
-		    # Don't want to keep the old pkgdb around, since we're
-		    # nuking the filesystem
-		    rm -rf /tmp/data_preserved/pkgdb
-		    if [ -f /tmp/data_old/conf/base/etc/hostid ]; then
-			cp -p /tmp/data_old/conf/base/etc/hostid /tmp/
-		    fi
-		    if [ -d /tmp/data_old/root/.ssh ]; then
-			cp -pR /tmp/data_old/root/.ssh /tmp/
-		    fi
-		    if [ -d /tmp/data_old/boot/modules ]; then
-			mkdir -p /tmp/modules
-			for i in `ls /tmp/data_old/boot/modules`
-		do
-	    cp -p /tmp/data_old/boot/modules/$i /tmp/modules/
-		done
-	    fi
-	    if [ -d /tmp/data_old/usr/local/fusionio ]; then
-		cp -pR /tmp/data_old/usr/local/fusionio /tmp/
-	    fi
-	    if [ -f /tmp/data_old/boot.config ]; then
-		cp /tmp/data_old/boot.config /tmp/
-	    fi
-	    if [ -f /tmp/data_old/boot/loader.conf.local ]; then
-		cp /tmp/data_old/boot/loader.conf.local /tmp/
-	    fi
-	    umount /tmp/data_old || return 1
-	    zpool export freenas-boot || return 1
-	    return 0
-        fi
-      fi
-    fi # End of if NEW upgrade style
-
-    # This is now legacy code, to support the old
-    # partitioning scheme (freenas-9.2 and earlier)
-    if ! mount "${data_part}" /tmp/data_old ; then
+    # If the active dataset doesn't have a database file,
+    # then it's not FN as far as we're concerned (the upgrade code
+    # will go badly).
+    # We also check for the Corral database directory.
+    if [ ! -f /tmp/data_old/data/freenas-v1.db -o \
+	   -d /tmp/data_old/data/freenas.db ]; then
+	umount /tmp/data_old || true
+	zpool export ${BOOT_POOL} || true
 	return 1
     fi
 
-    ls /tmp/data_old > /tmp/data_old.ls
-    if [ -f /tmp/data_old/freenas-v1.db ]; then
-        _rv=0
-    fi
-    # XXX side effect, shouldn't be here!
-    cp -pR /tmp/data_old/. /tmp/data_preserved
-    umount /tmp/data_old
-    if [ $_rv -eq 0 ]; then
-	# For GUI upgrades, we only have one OS partition
-	# that has conf/base/etc.  For ISO upgrades, we
-	# have two, but only one is active.
-	slice=$(gpart show ${_disk} | grep -F '[active]' | awk ' { print $3;}')
-	if [ -z "${slice}" ]; then
-	    # We don't have an active slice, so something is wrong.
-	    return 1
-	fi
-	mount /dev/${_disk}s${slice}a /tmp/data_old
-	ls /tmp/data_old > /dev/null
-	if [ ! -d /tmp/data_old/conf/base/etc ]
-	then
-	    # Mount the other partition
-	    if [ "${slice}" -eq 1 ]; then
-		slice=2
-	    else
-		slice=1
-	    fi
-	    umount /tmp/data_old
-	    mount /dev/${_disk}s${slice}a /tmp/data_old
-	    ls /tmp/data_old > /dev/null
-	fi
-	if [ -f /tmp/data_old/conf/base/etc/hostid ]; then
-	    cp -p /tmp/data_old/conf/base/etc/hostid /tmp/
-	fi
-        if [ -d /tmp/data_old/root/.ssh ]; then
-            cp -pR /tmp/data_old/root/.ssh /tmp/
-        fi
-        if [ -d /tmp/data_old/boot/modules ]; then
-            mkdir -p /tmp/modules
-            for i in `ls /tmp/data_old/boot/modules`
-            do
-                cp -p /tmp/data_old/boot/modules/$i /tmp/modules/
-            done
-        fi
-        if [ -d /tmp/data_old/usr/local/fusionio ]; then
-            cp -pR /tmp/data_old/usr/local/fusionio /tmp/
-        fi
-	if [ -f /tmp/data_old/boot.config ]; then
-	    cp /tmp/data_old/boot.config /tmp/
-	fi
-	if [ -f /tmp/data_old/boot/loader.conf.local ]; then
-	    cp /tmp/data_old/boot/loader.conf.local /tmp/
-	fi
-        umount /tmp/data_old
-    fi
-    rmdir /tmp/data_old
-    return $_rv
+    # Try to preserve some miscellaneous files and directories if they exist.
+    preserve_data
+
+    umount /tmp/data_old || return 1
+    zpool export ${BOOT_POOL} || return 1
+    return 0
 }
 
-prompt_password() {
-
+prompt_password()
+{
     local values value password="" password1 password2 _counter _tmpfile="/tmp/pwd.$$"
 
     cat << __EOF__ > /tmp/dialogconf
@@ -735,54 +709,57 @@ __EOF__
     rm -f ${DIALOGRC}
     unset DIALOGRC
 
-
     echo -n "${password}" 1>&2
-
 }
 
 create_be()
 {
-  if [ $# -ne 1 ]; then
-    return 1
-  fi
+    local mountpoint=$1
+    local disk=$2 # More disks may be passed, but we only need one.
+    local pool_guid=""
 
-  echo "Creating new Boot-Environment"
+    echo "Creating new Boot-Environment"
 
-  # When upgrading, we will simply create a new BE dataset and install
-  # fresh into that, so old datasets are not lost
-  zpool import -N -f freenas-boot || return 1
+    # When upgrading, we will simply create a new BE dataset and install
+    # fresh into that, so old datasets are not lost.  The pool is imported
+    # by GUID for safety in case multiple ${BOOT_POOL} pools are present.
+    pool_guid=$(get_disk_pool_guid ${disk})
+    zpool import -N -f ${pool_guid} || return 1
 
-  # First we need to nuke any old grub dataset
-  if zfs list freenas-boot/grub >/dev/null 2>/dev/null ; then
-      echo "Removing GRUB dataset"
-      zfs destroy -R -f freenas-boot/grub
+    # Create the new BE
+    zfs create -o mountpoint=legacy ${BOOT_POOL}/ROOT/${BENAME} || return 1
+    zfs set beadm:keep=True ${BOOT_POOL}/ROOT/${BENAME} || return 1
 
-      _cDir="/tmp/_beClean"
-      if [ ! -e "${_cDir}" ] ; then
-          mkdir ${_cDir}
-      fi
+    # Mount the new BE datasets
+    mkdir -p ${mountpoint}
+    mount -t zfs ${BOOT_POOL}/ROOT/${BENAME} ${mountpoint} || return 1
+    mkdir -p ${mountpoint}/data
 
-      # Sanitize the old BE's by removing grub fstab entries
-      for _be in `zfs list -H -d 1 freenas-boot/ROOT | awk '{print $1}' | cut -d '/' -f 3`
-      do
-	  mount -t zfs freenas-boot/ROOT/${_be} ${_cDir}
-	  if [ -e ${_cDir}/etc/fstab ] ; then
-	      cp ${_cDir}/etc/fstab ${_cDir}/etc/fstab.oldGRUB
-	      cat ${_cDir}/etc/fstab.oldGRUB | grep -v "^freenas-boot/grub" > ${_cDir}/etc/fstab
-	  fi
-	  umount -f ${_cDir}
-      done
-  fi
+    return 0
+}
 
-  # Create the new BE
-  zfs create -o mountpoint=legacy freenas-boot/ROOT/${BENAME} || return 1
+cleanup()
+{
+    zpool export -f ${BOOT_POOL}
+    zpool export -f ${NEW_BOOT_POOL}
+}
 
-  # Mount the new BE datasets
-  mkdir -p ${1}
-  mount -t zfs freenas-boot/ROOT/${BENAME} ${1} || return 1
-  mkdir -p ${1}/data
+abort()
+{
+    set +e +x
+    trap - EXIT
+    exit 1
+}
 
-  return 0
+fail()
+{
+    local _action=${1}
+    shift
+    local _disks=${@}
+
+    set +x
+    read -p "The ${AVATAR_PROJECT} ${_action} on ${_disks} has failed. Press enter to continue..." junk
+    abort
 }
 
 menu_install()
@@ -791,33 +768,26 @@ menu_install()
     local _disklist
     local _tmpfile
     local _answer
-    local _cdlist
     local _items
     local _disk
     local _disks=""
     local _realdisks=""
-    local _disk_old
     local _config_file
     local _desc
     local _list
     local _msg
-    local _satadom
-    local _i
     local _do_upgrade=""
     local _menuheight
     local _msg
     local _dlv
     local _password
-    local os_part
-    local data_part
-    local upgrade_style="new"
     local whendone=""
-    
-    local readonly CD_UPGRADE_SENTINEL="/data/cd-upgrade"
-    local readonly NEED_UPDATE_SENTINEL="/data/need-update"
+
+    local CD_UPGRADE_SENTINEL NEED_UPDATE_SENTINEL FIRST_INSTALL_SENTINEL
+    readonly CD_UPGRADE_SENTINEL="/data/cd-upgrade"
+    readonly NEED_UPDATE_SENTINEL="/data/need-update"
     # create a sentinel file for post-fresh-install boots
-    local readonly FIRST_INSTALL_SENTINEL="/data/first-boot"
-    local readonly POOL="freenas-boot"
+    readonly FIRST_INSTALL_SENTINEL="/data/first-boot"
 
     _tmpfile="/tmp/answer"
     TMPFILE=$_tmpfile
@@ -841,7 +811,7 @@ menu_install()
 	esac
     done
     shift $((OPTIND-1))
-    
+
     if [ $# -gt 0 ]
     then
 	_disks="$@"
@@ -850,48 +820,44 @@ menu_install()
 	INTERACTIVE=true
     fi
 
+    # Make sure we are working from a clean slate.
+    cleanup 2>&1 >/dev/null
+
     if ${INTERACTIVE}; then
 	pre_install_check || return 0
     fi
-    
-    if do_sata_dom
-    then
-	_satadom="YES"
-    else
-	_satadom=""
-	if ${INTERACTIVE}; then
-	    get_physical_disks_list
-	    _disklist="${VAL}"
 
-	    _list=""
-	    _items=0
-	    for _disk in ${_disklist}; do
-		get_media_description "${_disk}"
-		_desc="${VAL}"
-		_list="${_list} ${_disk} '${_desc}' off"
-		_items=$((${_items} + 1))
-	    done
+    if ${INTERACTIVE}; then
+        get_physical_disks_list
+        _disklist="${VAL}"
+
+        _list=""
+        _items=0
+        for _disk in ${_disklist}; do
+            _desc=$(get_media_description "${_disk}" | sed "s/'/'\\\''/g")
+            _list="${_list} ${_disk} '${_desc}' off"
+            _items=$((${_items} + 1))
+        done
 	    
-	    _tmpfile="/tmp/answer"
-	    if [ ${_items} -ge 10 ]; then
-		_items=10
-		_menuheight=20
-	    else
-		_menuheight=9
-		_menuheight=$((${_menuheight} + ${_items}))
-	    fi
-	    if [ "${_items}" -eq 0 ]; then
-		# Inform the user
-		eval "dialog --title 'Choose destination media' --msgbox 'No drives available' 5 60" 2>${_tmpfile}
-		return 0
-	    fi
+        _tmpfile="/tmp/answer"
+        if [ ${_items} -ge 10 ]; then
+            _items=10
+            _menuheight=20
+        else
+            _menuheight=9
+            _menuheight=$((${_menuheight} + ${_items}))
+        fi
+        if [ "${_items}" -eq 0 ]; then
+            # Inform the user
+            eval "dialog --title 'Choose destination media' --msgbox 'No drives available' 5 60" 2>${_tmpfile}
+            abort
+        fi
 
-	    eval "dialog --title 'Choose destination media' \
-	      --checklist 'Select one or more drives where $AVATAR_PROJECT should be installed (use arrow keys to navigate to the drive(s) for installation; select a drive with the spacebar).' \
-	      ${_menuheight} 60 ${_items} ${_list}" 2>${_tmpfile}
-	    [ $? -eq 0 ] || exit 1
-	fi
-    fi # ! do_sata_dom
+        eval "dialog --title 'Choose destination media' \
+            --checklist 'Select one or more drives where $AVATAR_PROJECT should be installed (use arrow keys to navigate to the drive(s) for installation; select a drive with the spacebar).' \
+            ${_menuheight} 60 ${_items} ${_list}" 2>${_tmpfile}
+        [ $? -eq 0 ] || abort
+    fi
 
     if [ -f "${_tmpfile}" ]; then
 	_disks=$(eval "echo `cat "${_tmpfile}"`")
@@ -900,12 +866,12 @@ menu_install()
 
     if [ -z "${_disks}" ]; then
 	${INTERACTIVE} && dialog --msgbox "You need to select at least one disk!" 6 74
-	exit 1
+	abort
     fi
 
     if disk_is_mounted ${_disks} ; then
         ${INTERACTIVE} && dialog --msgbox "The destination drive is already in use!" 6 74
-        exit 1
+        abort
     fi
 
     _action="installation"
@@ -921,44 +887,26 @@ menu_install()
     # data from a freenas installation.  It also does
     # a zpool import.
     for _disk in ${_disks}; do
-    if disk_is_freenas ${_disk} ; then
-        if ${INTERACTIVE}; then
-	    if ask_upgrade ${_disk} ; then
-		_do_upgrade=1
-		_action="upgrade"
+	if disk_is_freenas ${_disk} ; then
+	    if ${INTERACTIVE}; then
+		if ask_upgrade ${_disk} ; then
+		    _do_upgrade=1
+		    _action="upgrade"
+		fi
+	    else
+		if [ "${_do_upgrade}" != "0" ]; then
+		    _do_upgrade=1
+		    _action="upgrade"
+		fi
 	    fi
-	else
-	    if [ "${_do_upgrade}" != "0" ]; then
-		_do_upgrade=1
-		_action="upgrade"
+	    # Ask if we want to do a format or inplace upgrade
+	    if ${INTERACTIVE}; then
+		if ask_upgrade_inplace ; then
+		    _upgrade_type="inplace"
+		fi
 	    fi
+	    break
 	fi
-	if [ -c /dev/${_disk}s4 ]; then
-	    upgrade_style="old"
-	elif [ -c /dev/${_disk}p2 ]; then
-	    upgrade_style="new"
-	else
-	    echo "Unknown upgrade style" 1>&2
-	    exit 1
-	fi
-	# Ask if we want to do a format or inplace upgrade
-        if ${INTERACTIVE}; then
-	    if ask_upgrade_inplace ; then
-		_upgrade_type="inplace"
-	    fi
-	fi
-	break
-    elif [ "${_satadom}" = "YES" -a -c /dev/ufs/TrueNASs4 ]; then
-	# Special hack for USB -> DOM upgrades
-	_disk_old=`glabel status | grep ' ufs/TrueNASs4 ' | awk '{ print $3 }' | sed -e 's,s4$,,g'`
-	if disk_is_freenas ${_disk_old} ; then
-	    if ask_upgrade ${_disk_old} ; then
-		_do_upgrade=2
-		_action="upgrade"
-		break
-	    fi
-	fi
-    fi
     done
     # If we haven't set _do_upgrade by now, we're not
     # doing an upgrade.
@@ -966,12 +914,7 @@ menu_install()
 	_do_upgrade=0
     fi
 
-    if [ "${_satadom}" = "YES" -a -n "$(echo ${_disks}|grep "raid/")" ]; then
-	_realdisks=$(cat ${REALDISKS})
-    else
-	_realdisks=$_disks
-    fi
-
+    _realdisks=$_disks
 
     ${INTERACTIVE} && new_install_verify "$_action" "$_upgrade_type" ${_realdisks}
     _config_file="/tmp/pc-sysinstall.cfg"
@@ -989,53 +932,14 @@ menu_install()
 	# or else it'll do an update anyway.  Oops.
 	rm -rf /tmp/data_preserved
     fi
-    # Start critical section.
-    if ${INTERACTIVE}; then
-	trap "set +x; read -p \"The $AVATAR_PROJECT $_action on ${_realdisks} has failed. Press enter to continue.. \" junk" EXIT
-    else
-#	trap "echo \"The ${AVATAR_PROJECT} ${_action} on ${_realdisks} has failed.\" ; sleep 15" EXIT
-	trap "set +x; read -p \"The $AVATAR_PROJECT $_action on ${_realdisks} has failed. Press enter to continue.. \" junk" EXIT
-    fi
-    set -e
-#    set -x
 
-    #  _disk, _image, _config_file
-    # we can now build a config file for pc-sysinstall
-    # build_config  ${_disk} "$(get_image_name)" ${_config_file}
+    # Start critical section.
+    trap "fail ${_action} ${_realdisks}" EXIT
+    set -e
 
     if [ ${_do_upgrade} -eq 1 ]
     then
         /etc/rc.d/dmesg start
-        mkdir -p /tmp/data
-	if [ "${upgrade_style}" = "old" ]; then
-	    # For old style, we have two potential
-	    # partitions to look at:  s1a and s2a.
-	    # 
-	    slice=$(gpart show ${_disk} | grep -F '[active]' | awk ' { print $3;}')
-	    if [ -z "${slice}" ]; then
-		# We don't have an active slice, so something is wrong.
-		false
-	    fi
-	    mount /dev/${_disk}s${slice}a /tmp/data
-	    ls /tmp/data > /dev/null
-	    if [ ! -d /tmp/data/conf/base/etc ]
-	    then
-		# Mount the other partition
-		if [ "${slice}" -eq 1 ]; then
-		    slice=2
-		else
-		    slice=1
-		fi
-		umount /tmp/data
-		mount /dev/${_disk}s${slice}a /tmp/data
-		ls /tmp/data > /dev/null
-	    fi
-            umount /tmp/data
-	elif [ "${upgrade_style}" != "new" ]; then
-		echo "Unknown upgrade style" 1>&2
-		false
-	fi
-        rmdir /tmp/data
     else
 	# Destroy existing partition table, if there is any but tolerate
 	# failure.
@@ -1051,15 +955,15 @@ menu_install()
     # Hack #2
     ls $(get_product_path) > /dev/null
 
-    if [ ${_do_upgrade} -eq 1 -a ${upgrade_style} = "new" -a "${_upgrade_type}" = "inplace" ]
+    if [ ${_do_upgrade} -eq 1 -a "${_upgrade_type}" = "inplace" ]
     then
       # Set the boot-environment name
       BENAME="default-`date +%Y%m%d-%H%M%S`"
       export BENAME
 
-      # When doing new-style upgrades, we can keep the old zpool
-      # and instead do a new BE creation
-      create_be /tmp/data
+      # When doing in-place upgrades, we can keep the old zpool
+      # and instead do a new BE creation.
+      create_be /tmp/data ${_realdisks}
     else
       # Set the boot-environment name
       BENAME="default"
@@ -1089,18 +993,17 @@ menu_install()
       fi
       export BOOTMODE
 
-      # We repartition on fresh install, or old upgrade_style
-      # This destroys all of the pool data, and
-      # ensures a clean filesystems.
-      partition_disk ${_realdisks}
+      # We repartition on fresh install or on upgrade when requested.
+      # This destroys all of the pool data and ensures a clean filesystem.
+      partition_disks ${_realdisks}
       mount_disk /tmp/data
     fi
 
     if [ -d /tmp/data_preserved ]; then
 	cp -pR /tmp/data_preserved/. /tmp/data/data
-	# we still need the newer version we are upgrading to's
+	# We still need the newer version we are upgrading to's
 	# factory-v1.db, else issuing a factory-restore on the
-	# newly upgraded system completely horks the system
+	# newly upgraded system completely borks the system.
 	cp /data/factory-v1.db /tmp/data/data/
 	chown www:www /tmp/data/data/factory-v1.db
     else
@@ -1108,18 +1011,12 @@ menu_install()
 	chown -R www:www /tmp/data/data
     fi
 
-    local OS=FreeNAS
-    if is_truenas; then
-        OS=TrueNAS
-    fi
+    local OS=TrueNAS
 
     # Tell it to look in /.mount for the packages.
     /usr/local/bin/freenas-install -P /.mount/${OS}/Packages -M /.mount/${OS}-MANIFEST /tmp/data
 
     rm -f /tmp/data/conf/default/etc/fstab /tmp/data/conf/base/etc/fstab
-    if is_truenas; then
-       make_swap ${_realdisks}
-    fi
     ln /tmp/data/etc/fstab /tmp/data/conf/base/etc/fstab || echo "Cannot link fstab"
     if [ "${_do_upgrade}" -ne 0 ]; then
 	if [ -f /tmp/hostid ]; then
@@ -1128,7 +1025,7 @@ menu_install()
 	if [ -d /tmp/.ssh ]; then
             cp -pR /tmp/.ssh /tmp/data/root/
 	fi
-	
+
 	# TODO: this needs to be revisited.
 	if [ -d /tmp/modules ]; then
             for i in `ls /tmp/modules`
@@ -1150,19 +1047,14 @@ menu_install()
 		-e '/^kernel=.*/d' /tmp/data/boot/loader.conf /tmp/data/boot/loader.conf.local
 	fi
     fi
-    
+
     # To support Xen, we need to disable HPET.
     if [ "$(/tmp/data/usr/local/sbin/dmidecode -s system-product-name)" = "HVM domU" ]; then
 	if ! grep -q 'hint.hpet.0.clock' /tmp/data/boot/loader.conf.local 2>/dev/null ; then
 	    echo 'hint.hpet.0.clock="0"' >> /tmp/data/boot/loader.conf.local
 	fi
     fi
-    # Debugging pause.
-    # read foo
-    
-    # XXX: Fixup
-    # tar cf - -C /tmp/data/conf/base etc | tar xf - -C /tmp/data/
-    
+
     # beadm will need a devfs
     mount -t devfs devfs /tmp/data/dev
     # Create a temporary /var
@@ -1174,10 +1066,9 @@ menu_install()
     # Save current serial console settings into database.
     save_serial_settings /tmp/data
     # Set default boot filesystem
-    zpool set bootfs=freenas-boot/ROOT/${BENAME} freenas-boot
+    zpool set bootfs=${BOOT_POOL}/ROOT/${BENAME} ${BOOT_POOL}
     install_loader /tmp/data ${_realdisks}
-    
-#    set +x
+
     if [ -d /tmp/data_preserved ]; then
 	# Instead of sentinel files, let's just migrate!
 	# Unfortunately, this doesn't seem to work well.
@@ -1189,7 +1080,7 @@ menu_install()
 	: > /tmp/data/${CD_UPGRADE_SENTINEL}
 	: > /tmp/data/${NEED_UPDATE_SENTINEL}
 	${INTERACTIVE} && dialog --msgbox "The installer has preserved your database file.
-#$AVATAR_PROJECT will migrate this file, if necessary, to the current format." 6 74
+$AVATAR_PROJECT will migrate this file, if necessary, to the current format." 6 74
     elif [ "${_do_upgrade}" -eq 0 ]; then
 	if [ -n "${_password}" ]; then
 		# Set the root password
@@ -1197,30 +1088,13 @@ menu_install()
 	fi
     fi
     : > /tmp/data/${FIRST_INSTALL_SENTINEL}
-    # Finally, before we unmount, start a srub.
-    # zpool scrub freenas-boot || true
+
+    # Finally, before we unmount, start a scrub.
+    # zpool scrub ${BOOT_POOL} || true
 
     umount /tmp/data/dev
     umount /tmp/data/var
     umount /tmp/data/
-
-    # We created a 16m swap partition earlier, for TrueNAS
-    # And created /data/fstab.swap as well.
-    if is_truenas ; then
-#        # Put a swap partition on newly created installation image
-#        if [ -e /dev/${_disk}s3 ]; then
-#            gpart delete -i 3 ${_disk}
-#            gpart add -t freebsd ${_disk}
-#            echo "/dev/${_disk}s3.eli		none			swap		sw		0	0" > /tmp/fstab.swap
-#        fi
-#
-#        mkdir -p /tmp/data
-#        mount /dev/${_disk}s4 /tmp/data
-#        ls /tmp/data > /dev/null
-#        mv /tmp/fstab.swap /tmp/data/
-#        umount /tmp/data
-#        rmdir /tmp/data
-    fi
 
     # End critical section.
     set +e
@@ -1353,12 +1227,10 @@ main()
             4) menu_shutdown ;;
             5) menu_test ;;
         esac
+        # Unset cached setting
+        unset SWAP_IS_SAFE
     done
 }
-
-if is_truenas ; then
-    . "$(dirname "$0")/install_sata_dom.sh"
-fi
 
 # Parse a config file.
 # We don't do much in the way of error checking.
@@ -1368,7 +1240,8 @@ fi
 # The output is suitable to be used as the arguments
 # to main(), which will directl ycall menu_install().
 
-yesno() {
+yesno()
+{
     # Output "true" or "false" depending on the argument
     if [ $# -ne 1 ]; then
 	echo "false"
@@ -1381,7 +1254,8 @@ yesno() {
     return 0
 }
 
-getsize() {
+getsize()
+{
     # Given a size specifier, convert it to bytes.
     # No suffix, or a suffix of "[bBcC]", means bytes;
     # [kK] is 1024, etc.
@@ -1399,8 +1273,9 @@ getsize() {
     esac
     return 0
 }
-	
-parse_config() {
+
+parse_config()
+{
     local _conf="/etc/install.conf"
     local _diskList=""
     local _minSize=""
@@ -1418,7 +1293,7 @@ parse_config() {
     local _diskCount=0
     local password=""
     local whenDone=""
-    
+
     while read line
     do
 	if expr "${line}" : "^#" > /dev/null
@@ -1458,7 +1333,7 @@ parse_config() {
     # For the install, the mount situation is complex,
     # but we want to look for a label of "INSTALL" and find
     # out the device for that.
-    _boot=$(glabel status | awk ' /INSTALL/ { print $3;}')
+    _boot=$(glabel status | awk '/INSTALL/ { print $3 }')
     if [ -n "${_upgrade}" ]; then
 	# Option to do an upgrade
 	_output="-U ${_upgrade}"
@@ -1482,7 +1357,7 @@ parse_config() {
 	if [ "${_disk}" = "${_boot}" ]; then
 	    continue
 	fi
-	_diskSize=$(diskinfo ${_disk} | awk ' { print $3; }')
+	_diskSize=$(diskinfo ${_disk} | cut -f 3)
 	if [ -n "${_minSize}" ] && [ "${_diskSize}" -lt "${_minSize}" ]; then
 	    continue
 	fi

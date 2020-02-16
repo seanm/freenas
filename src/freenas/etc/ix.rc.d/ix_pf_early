@@ -2,10 +2,15 @@
 #
 # $FreeBSD$
 #
+# Copyright (c) 2015 iXsystems, Inc.
+# All rights reserved.
+# This file is a part of TrueNAS
+# and may not be copied and/or distributed
+# without the express permission of iXsystems.
 
 # PROVIDE: ix_pf_early
-# BEFORE: mountd
-# REQUIRE: ipfw
+# BEFORE: routing
+# REQUIRE: FILESYSTEMS netif
 # KEYWORD: nojail
 
 . /etc/rc.subr
@@ -17,7 +22,7 @@ stop_cmd=":"
 
 ix_pf_early_start()
 {
-	/bin/sh /etc/ipfw.conf.block
+	checkyesno failover_enable || /sbin/pfctl -ef /etc/pf.conf.block
 }
 
 run_rc_command "$1"

@@ -24,238 +24,34 @@
 #
 #####################################################################
 
+import asyncio
+import asyncssh
+import contextlib
+import glob
 import os
 import re
-import errno
-import pwd
-import tempfile
-import subprocess
-import threading
-import shutil
-import asyncssh
-import glob
-import asyncio
+import shlex
 
-from collections import defaultdict
-from middlewared.schema import accepts, Bool, Cron, Dict, Str, Int, Ref, List, Patch
+from middlewared.async_validators import check_path_resides_within_volume
+from middlewared.schema import accepts, Bool, Cron, Dict, Str, Int, List, Patch
 from middlewared.validators import Range, Match
 from middlewared.service import (
-    Service, job, CallError, CRUDService, private, SystemServiceService, ValidationErrors
+    CallError, CRUDService, SystemServiceService, ValidationErrors,
+    job, item_method, private,
 )
-from middlewared.logger import Logger
+import middlewared.sqlalchemy as sa
+from middlewared.utils.osc import run_command_with_user_context
 
 
-logger = Logger('rsync').getLogger()
-RSYNC_PATH = '/usr/local/bin/rsync'
+RSYNC_PATH_LIMIT = 1023
 
 
-def demote(user):
-    """
-    Helper function to call the subprocess as the specific user.
-    Taken from: https://gist.github.com/sweenzor/1685717
-    Pass the function 'set_ids' to preexec_fn, rather than just calling
-    setuid and setgid. This will change the ids for that subprocess only"""
+class RsyncdModel(sa.Model):
+    __tablename__ = 'services_rsyncd'
 
-    def set_ids():
-        if user:
-            user_info = pwd.getpwnam(user)
-            os.setgid(user_info.pw_gid)
-            os.setuid(user_info.pw_uid)
-
-    return set_ids
-
-
-class RsyncService(Service):
-
-    def __rsync_worker(self, line, user, job):
-        proc_stdout = tempfile.TemporaryFile(mode='w+b', buffering=0)
-        try:
-            rsync_proc = subprocess.Popen(
-                line,
-                shell=True,
-                stdout=proc_stdout.fileno(),
-                stderr=subprocess.PIPE,
-                bufsize=0,
-                preexec_fn=demote(user)
-            )
-            seek = 0
-            old_seek = 0
-            progress = 0
-            message = 'Starting rsync copy job...'
-            while rsync_proc.poll() is None:
-                job.set_progress(progress, message)
-                proc_op = ''
-                proc_stdout.seek(seek)
-                try:
-                    while True:
-                        op_byte = proc_stdout.read(1).decode('utf8')
-                        if op_byte == '':
-                            # In this case break before incrementing `seek`
-                            break
-                        seek += 1
-                        if op_byte == '\r':
-                            break
-                        proc_op += op_byte
-                        seek += 1
-                    if old_seek != seek:
-                        old_seek = seek
-                        message = proc_op.strip()
-                        try:
-                            progress = int([x for x in message.split(' ') if '%' in x][0][:-1])
-                        except (IndexError, ValueError):
-                            pass
-                except BaseException as err:
-                    # Catch IOERROR Errno 9 which usually arises because
-                    # of already closed fileobject being used here therby
-                    # raising Bad File Descriptor error. In this case break
-                    # and the outer while loop will check for rsync_proc.poll()
-                    # to be None or not and DTRT
-                    if hasattr(err, 'errno') and err.errno == 9:
-                        break
-                    logger.debug('Error whilst parsing rsync progress', exc_info=True)
-
-        except BaseException as e:
-            raise CallError(f'Rsync copy job id: {job.id} failed due to: {e}', errno.EIO)
-
-        if rsync_proc.returncode != 0:
-            job.set_progress(None, 'Rsync copy job failed')
-            raise CallError(
-                f'Rsync copy job id: {job.id} returned non-zero exit code. Command used was: {line}. Error: {rsync_proc.stderr.read()}'
-            )
-
-    @accepts(Dict(
-        'rsync-copy',
-        Str('user', required=True),
-        Str('path', required=True),
-        Str('remote_user'),
-        Str('remote_host', required=True),
-        Str('remote_path'),
-        Int('remote_ssh_port'),
-        Str('remote_module'),
-        Str('direction', enum=['PUSH', 'PULL'], required=True),
-        Str('mode', enum=['MODULE', 'SSH'], required=True),
-        Str('remote_password'),
-        Dict(
-            'properties',
-            Bool('recursive'),
-            Bool('compress'),
-            Bool('times'),
-            Bool('archive'),
-            Bool('delete'),
-            Bool('preserve_permissions'),
-            Bool('preserve_attributes'),
-            Bool('delay_updates')
-        ),
-        required=True
-    ))
-    @job()
-    def copy(self, job, rcopy):
-        """
-        Starts an rsync copy task between current freenas machine
-        and specified remote host (or local copy too). It reports
-        the progress of the copy task.
-        """
-
-        # Assigning variables and such
-        user = rcopy.get('user')
-        path = rcopy.get('path')
-        mode = rcopy.get('mode')
-        remote_path = rcopy.get('remote_path')
-        remote_host = rcopy.get('remote_host')
-        remote_module = rcopy.get('remote_module')
-        remote_user = rcopy.get('remote_user', rcopy.get('user'))
-        remote_address = remote_host if '@' in remote_host else f'"{remote_user}"@{remote_host}'
-        remote_password = rcopy.get('remote_password', None)
-        password_file = None
-        properties = rcopy.get('properties', defaultdict(bool))
-
-        # Let's do a brief check of all the user provided parameters
-        if not path:
-            raise ValueError('The path is required')
-        elif not os.path.exists(path):
-            raise CallError(f'The specified path: {path} does not exist', errno.ENOENT)
-
-        if not remote_host:
-            raise ValueError('The remote host is required')
-
-        if mode == 'SSH' and not remote_path:
-            raise ValueError('The remote path is required')
-        elif mode == 'MODULE' and not remote_module:
-            raise ValueError('The remote module is required')
-
-        try:
-            pwd.getpwnam(user)
-        except KeyError:
-            raise CallError(f'User: {user} does not exist', errno.ENOENT)
-        if (
-            mode == 'SSH' and
-            rcopy.get('remote_host') in ['127.0.0.1', 'localhost'] and
-            not os.path.exists(remote_path)
-        ):
-            raise CallError(f'The specified path: {remote_path} does not exist', errno.ENOENT)
-
-        # Phew! with that out of the let's begin the transfer
-
-        line = f'{RSYNC_PATH} --info=progress2 -h'
-        if properties:
-            if properties.get('recursive'):
-                line += ' -r'
-            if properties.get('times'):
-                line += ' -t'
-            if properties.get('compress'):
-                line += ' -z'
-            if properties.get('archive'):
-                line += ' -a'
-            if properties.get('preserve_permissions'):
-                line += ' -p'
-            if properties.get('preserve_attributes'):
-                line += ' -X'
-            if properties.get('delete'):
-                line += ' --delete-delay'
-            if properties.get('delay_updates'):
-                line += ' --delay-updates'
-
-        if mode == 'MODULE':
-            if rcopy.get('direction') == 'PUSH':
-                line += f' "{path}" {remote_address}::"{remote_module}"'
-            else:
-                line += f' {remote_address}::"{remote_module}" "{path}"'
-            if remote_password:
-                password_file = tempfile.NamedTemporaryFile(mode='w')
-
-                password_file.write(remote_password)
-                password_file.flush()
-                shutil.chown(password_file.name, user=user)
-                os.chmod(password_file.name, 0o600)
-                line += f' --password-file={password_file.name}'
-        else:
-            # there seems to be some code duplication here but hey its simple
-            # if you find a way (THAT DOES NOT BREAK localhost based rsync copies)
-            # then please go for it
-            if rcopy.get('remote_host') in ['127.0.0.1', 'localhost']:
-                if rcopy['direction'] == 'PUSH':
-                    line += f' "{path}" "{remote_path}"'
-                else:
-                    line += f' "{remote_path}" "{path}"'
-            else:
-                line += ' -e "ssh -p {0} -o BatchMode=yes -o StrictHostKeyChecking=yes"'.format(
-                    rcopy.get('remote_ssh_port', 22)
-                )
-                if rcopy['direction'] == 'PUSH':
-                    line += f' "{path}" {remote_address}:\\""{remote_path}"\\"'
-                else:
-                    line += f' {remote_address}:\\""{remote_path}"\\" "{path}"'
-
-        logger.debug(f'Executing rsync job id: {job.id} with the following command {line}')
-        try:
-            t = threading.Thread(target=self.__rsync_worker, args=(line, user, job), daemon=True)
-            t.start()
-            t.join()
-        finally:
-            if password_file:
-                password_file.close()
-
-        job.set_progress(100, 'Rsync copy job successfully completed')
+    id = sa.Column(sa.Integer(), primary_key=True)
+    rsyncd_port = sa.Column(sa.Integer(), default=873)
+    rsyncd_auxiliary = sa.Column(sa.Text())
 
 
 class RsyncdService(SystemServiceService):
@@ -268,9 +64,15 @@ class RsyncdService(SystemServiceService):
     @accepts(Dict(
         'rsyncd_update',
         Int('port', validators=[Range(min=1, max=65535)]),
-        Str('auxiliary')
+        Str('auxiliary', max_length=None),
+        update=True
     ))
     async def do_update(self, data):
+        """
+        Update Rsyncd Service Configuration.
+
+        `auxiliary` attribute can be used to pass on any additional parameters from rsyncd.conf(5).
+        """
         old = await self.config()
 
         new = old.copy()
@@ -281,36 +83,96 @@ class RsyncdService(SystemServiceService):
         return new
 
 
+class RsyncModModel(sa.Model):
+    __tablename__ = 'services_rsyncmod'
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    rsyncmod_name = sa.Column(sa.String(120))
+    rsyncmod_comment = sa.Column(sa.String(120))
+    rsyncmod_path = sa.Column(sa.String(255))
+    rsyncmod_mode = sa.Column(sa.String(120), default="rw")
+    rsyncmod_maxconn = sa.Column(sa.Integer(), default=0)
+    rsyncmod_user = sa.Column(sa.String(120), default="nobody")
+    rsyncmod_group = sa.Column(sa.String(120), default="nobody")
+    rsyncmod_hostsallow = sa.Column(sa.Text())
+    rsyncmod_hostsdeny = sa.Column(sa.Text())
+    rsyncmod_auxiliary = sa.Column(sa.Text())
+
+
 class RsyncModService(CRUDService):
 
     class Config:
         datastore = 'services.rsyncmod'
         datastore_prefix = 'rsyncmod_'
+        datastore_extend = 'rsyncmod.rsync_mod_extend'
+
+    @private
+    async def rsync_mod_extend(self, data):
+        data['hostsallow'] = data['hostsallow'].split()
+        data['hostsdeny'] = data['hostsdeny'].split()
+        data['mode'] = data['mode'].upper()
+        return data
+
+    @private
+    async def common_validation(self, data, schema_name):
+        verrors = ValidationErrors()
+
+        await check_path_resides_within_volume(verrors, self.middleware, f'{schema_name}.path', data.get('path'))
+
+        for entity in ('user', 'group'):
+            value = data.get(entity)
+            try:
+                await self.middleware.call(f'{entity}.get_{entity}_obj', {f'{entity}name': value})
+            except Exception:
+                verrors.add(
+                    f'{schema_name}.{entity}',
+                    f'Please specify a valid {entity}'
+                )
+
+        verrors.check()
+
+        data['hostsallow'] = ' '.join(data['hostsallow'])
+        data['hostsdeny'] = ' '.join(data['hostsdeny'])
+        data['mode'] = data['mode'].lower()
+
+        return data
 
     @accepts(Dict(
-        'rsyncmod',
+        'rsyncmod_create',
         Str('name', validators=[Match(r'[^/\]]')]),
         Str('comment'),
-        Str('path'),
-        Str('mode'),
+        Str('path', required=True, max_length=RSYNC_PATH_LIMIT),
+        Str('mode', enum=['RO', 'RW', 'WO']),
         Int('maxconn'),
-        Str('user'),
-        Str('group'),
-        List('hostsallow', items=[Str('hostsallow')]),
-        List('hostsdeny', items=[Str('hostdeny')]),
-        Str('auxiliary'),
+        Str('user', default='nobody'),
+        Str('group', default='nobody'),
+        List('hostsallow', items=[Str('hostsallow')], default=[]),
+        List('hostsdeny', items=[Str('hostdeny')], default=[]),
+        Str('auxiliary', max_length=None),
         register=True,
     ))
     async def do_create(self, data):
-        if data.get("hostsallow"):
-            data["hostsallow"] = " ".join(data["hostsallow"])
-        else:
-            data["hostsallow"] = ""
+        """
+        Create a Rsyncmod module.
 
-        if data.get("hostsdeny"):
-            data["hostsdeny"] = " ".join(data["hostsdeny"])
-        else:
-            data["hostsdeny"] = ""
+        `path` represents the path to a dataset. Path length is limited to 1023 characters maximum as per the limit
+        enforced by FreeBSD. It is possible that we reach this max length recursively while transferring data. In that
+        case, the user must ensure the maximum path will not be too long or modify the recursed path to shorter
+        than the limit.
+
+        `maxconn` is an integer value representing the maximum number of simultaneous connections. Zero represents
+        unlimited.
+
+        `hostsallow` is a list of patterns to match hostname/ip address of a connecting client. If list is empty,
+        all hosts are allowed.
+
+        `hostsdeny` is a list of patterns to match hostname/ip address of a connecting client. If the pattern is
+        matched, access is denied to the client. If no client should be denied, this should be left empty.
+
+        `auxiliary` attribute can be used to pass on any additional parameters from rsyncd.conf(5).
+        """
+
+        data = await self.common_validation(data, 'rsyncmod_create')
 
         data['id'] = await self.middleware.call(
             'datastore.insert',
@@ -318,36 +180,70 @@ class RsyncModService(CRUDService):
             data,
             {'prefix': self._config.datastore_prefix}
         )
-        await self.middleware.call('service.reload', 'rsync')
-        return data
 
-    @accepts(Int('id'), Ref('rsyncmod'))
+        await self._service_change('rsync', 'reload')
+
+        return await self._get_instance(data['id'])
+
+    @accepts(Int('id'), Patch('rsyncmod_create', 'rsyncmod_update', ('attr', {'update': True})))
     async def do_update(self, id, data):
-        module = await self.middleware.call(
-            'datastore.query',
-            self._config.datastore,
-            [('id', '=', id)],
-            {'prefix': self._config.datastore_prefix, 'get': True}
-        )
+        """
+        Update Rsyncmod module of `id`.
+        """
+        module = await self._get_instance(id)
         module.update(data)
 
-        module["hostsallow"] = " ".join(module["hostsallow"])
-        module["hostsdeny"] = " ".join(module["hostsdeny"])
+        module = await self.common_validation(module, 'rsyncmod_update')
 
         await self.middleware.call(
             'datastore.update',
             self._config.datastore,
             id,
-            data,
+            module,
             {'prefix': self._config.datastore_prefix}
         )
-        await self.middleware.call('service.reload', 'rsync')
 
-        return module
+        await self._service_change('rsync', 'reload')
+
+        return await self._get_instance(id)
 
     @accepts(Int('id'))
     async def do_delete(self, id):
+        """
+        Delete Rsyncmod module of `id`.
+        """
         return await self.middleware.call('datastore.delete', self._config.datastore, id)
+
+
+class RsyncTaskModel(sa.Model):
+    __tablename__ = 'tasks_rsync'
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    rsync_path = sa.Column(sa.String(255))
+    rsync_remotehost = sa.Column(sa.String(120))
+    rsync_remotemodule = sa.Column(sa.String(120))
+    rsync_desc = sa.Column(sa.String(120))
+    rsync_minute = sa.Column(sa.String(100), default="00")
+    rsync_hour = sa.Column(sa.String(100), default="*")
+    rsync_daymonth = sa.Column(sa.String(100), default="*")
+    rsync_month = sa.Column(sa.String(100), default='*')
+    rsync_dayweek = sa.Column(sa.String(100), default="*")
+    rsync_user = sa.Column(sa.String(60))
+    rsync_recursive = sa.Column(sa.Boolean(), default=True)
+    rsync_times = sa.Column(sa.Boolean(), default=True)
+    rsync_compress = sa.Column(sa.Boolean(), default=True)
+    rsync_archive = sa.Column(sa.Boolean(), default=False)
+    rsync_delete = sa.Column(sa.Boolean(), default=False)
+    rsync_quiet = sa.Column(sa.Boolean(), default=False)
+    rsync_preserveperm = sa.Column(sa.Boolean(), default=False)
+    rsync_preserveattr = sa.Column(sa.Boolean(), default=False)
+    rsync_extra = sa.Column(sa.Text())
+    rsync_enabled = sa.Column(sa.Boolean(), default=True)
+    rsync_mode = sa.Column(sa.String(20), default='module')
+    rsync_remotepath = sa.Column(sa.String(255))
+    rsync_direction = sa.Column(sa.String(10), default='PUSH')
+    rsync_remoteport = sa.Column(sa.SmallInteger(), default=22)
+    rsync_delayupdates = sa.Column(sa.Boolean(), default=True)
 
 
 class RsyncTaskService(CRUDService):
@@ -356,12 +252,35 @@ class RsyncTaskService(CRUDService):
         datastore = 'tasks.rsync'
         datastore_prefix = 'rsync_'
         datastore_extend = 'rsynctask.rsync_task_extend'
+        datastore_extend_context = 'rsynctask.rsync_task_extend_context'
 
     @private
-    async def rsync_task_extend(self, data):
+    async def rsync_task_extend(self, data, context):
         data['extra'] = list(filter(None, re.split(r"\s+", data["extra"])))
+        for field in ('mode', 'direction'):
+            data[field] = data[field].upper()
         Cron.convert_db_format_to_schedule(data)
+        data['job'] = context['jobs'].get(data['id'])
         return data
+
+    @private
+    async def rsync_task_extend_context(self, extra):
+        jobs = {}
+        for j in await self.middleware.call("core.get_jobs", [("method", "=", "rsynctask.run")],
+                                            {"order_by": ["id"]}):
+            try:
+                task_id = int(j["arguments"][0])
+            except (IndexError, ValueError):
+                continue
+
+            if task_id in jobs and jobs[task_id]["state"] == "RUNNING":
+                continue
+
+            jobs[task_id] = j
+
+        return {
+            "jobs": jobs,
+        }
 
     @private
     async def validate_rsync_task(self, data, schema):
@@ -375,10 +294,10 @@ class RsyncTaskService(CRUDService):
             verrors.add(f'{schema}.user', 'User names cannot have spaces')
             raise verrors
 
-        user = await self.middleware.call(
-            'notifier.get_user_object',
-            username
-        )
+        user = None
+        with contextlib.suppress(KeyError):
+            user = await self.middleware.call('dscache.get_uncached_user', username)
+
         if not user:
             verrors.add(f'{schema}.user', f'Provided user "{username}" does not exist')
             raise verrors
@@ -397,10 +316,10 @@ class RsyncTaskService(CRUDService):
             verrors.add(f'{schema}.mode', 'This field is required')
 
         remote_module = data.get('remotemodule')
-        if mode == 'module' and not remote_module:
+        if mode == 'MODULE' and not remote_module:
             verrors.add(f'{schema}.remotemodule', 'This field is required')
 
-        if mode == 'ssh':
+        if mode == 'SSH':
             remote_port = data.get('remoteport')
             if not remote_port:
                 verrors.add(f'{schema}.remoteport', 'This field is required')
@@ -409,9 +328,10 @@ class RsyncTaskService(CRUDService):
             if not remote_path:
                 verrors.add(f'{schema}.remotepath', 'This field is required')
 
-            search = os.path.join(user.pw_dir, '.ssh', 'id_[edr]*')
-            exclude_from_search = os.path.join(user.pw_dir, '.ssh', 'id_[edr]*pub')
-            if not set(glob.glob(search)) - set(glob.glob(exclude_from_search)):
+            search = os.path.join(user['pw_dir'], '.ssh', 'id_[edr]*')
+            exclude_from_search = os.path.join(user['pw_dir'], '.ssh', 'id_[edr]*pub')
+            key_files = set(glob.glob(search)) - set(glob.glob(exclude_from_search))
+            if not key_files:
                 verrors.add(
                     f'{schema}.user',
                     'In order to use rsync over SSH you need a user'
@@ -435,18 +355,18 @@ class RsyncTaskService(CRUDService):
                 remote_port
             ):
                 if '@' in remote_host:
-                    remote_username, remote_host = remote_host.split('@')
+                    remote_username, remote_host = remote_host.rsplit('@', 1)
                 else:
                     remote_username = username
 
                 try:
-                    with (await asyncio.wait_for(asyncssh.connect(
-                            remote_host,
-                            port=remote_port,
-                            username=remote_username), timeout=5)) as conn:
-
-                        await conn.run(f'test -d {remote_path}', check=True)
-
+                    async with await asyncio.wait_for(
+                        asyncssh.connect(
+                            remote_host, port=remote_port, username=remote_username,
+                            client_keys=key_files, known_hosts=None
+                        ), timeout=5,
+                    ) as conn:
+                        await conn.run(f'test -d {shlex.quote(remote_path)}', check=True)
                 except asyncio.TimeoutError:
 
                     verrors.add(
@@ -482,7 +402,7 @@ class RsyncTaskService(CRUDService):
                             f'{schema}.remotepath',
                             'The Remote Path you specified does not exist or is not a directory.'
                             'Either create one yourself on the remote machine or uncheck the '
-                            'rsync_validate_rpath field'
+                            'validate_rpath field'
                         )
                     else:
                         verrors.add(
@@ -507,24 +427,30 @@ class RsyncTaskService(CRUDService):
                     'Remote path could not be validated because of missing fields'
                 )
 
-        if data.get('validate_rpath'):
-            data.pop('validate_rpath')
+        data.pop('validate_rpath', None)
+
+        # Keeping compatibility with legacy UI
+        for field in ('mode', 'direction'):
+            data[field] = data[field].lower()
 
         return verrors, data
 
     @accepts(Dict(
         'rsync_task_create',
-        Str('path'),
+        Str('path', required=True, max_length=RSYNC_PATH_LIMIT),
         Str('user', required=True),
         Str('remotehost'),
         Int('remoteport'),
-        Str('mode'),
+        Str('mode', enum=['MODULE', 'SSH'], default='MODULE'),
         Str('remotemodule'),
         Str('remotepath'),
         Bool('validate_rpath'),
-        Str('direction'),
+        Str('direction', enum=['PULL', 'PUSH'], default='PUSH'),
         Str('desc'),
-        Cron('schedule'),
+        Cron(
+            'schedule',
+            defaults={'minute': '00'},
+        ),
         Bool('recursive'),
         Bool('times'),
         Bool('compress'),
@@ -539,6 +465,63 @@ class RsyncTaskService(CRUDService):
         register=True,
     ))
     async def do_create(self, data):
+        """
+        Create a Rsync Task.
+
+        See the comment in Rsyncmod about `path` length limits.
+
+        `remotehost` is ip address or hostname of the remote system. If username differs on the remote host,
+        "username@remote_host" format should be used.
+
+        `mode` represents different operating mechanisms for Rsync i.e Rsync Module mode / Rsync SSH mode.
+
+        `remotemodule` is the name of remote module, this attribute should be specified when `mode` is set to MODULE.
+
+        `remotepath` specifies the path on the remote system.
+
+        `validate_rpath` is a boolean which when sets validates the existence of the remote path.
+
+        `direction` specifies if data should be PULLED or PUSHED from the remote system.
+
+        `compress` when set reduces the size of the data which is to be transmitted.
+
+        `archive` when set makes rsync run recursively, preserving symlinks, permissions, modification times, group,
+        and special files.
+
+        `delete` when set deletes files in the destination directory which do not exist in the source directory.
+
+        `preserveperm` when set preserves original file permissions.
+
+        .. examples(websocket)::
+
+          Create a Rsync Task which pulls data from a remote system every 5 minutes.
+
+            :::javascript
+            {
+                "id": "6841f242-840a-11e6-a437-00e04d680384",
+                "msg": "method",
+                "method": "rsynctask.create",
+                "params": [{
+                    "enabled": true,
+                    "schedule": {
+                        "minute": "5",
+                        "hour": "*",
+                        "dom": "*",
+                        "month": "*",
+                        "dow": "*"
+                    },
+                    "desc": "Test rsync task",
+                    "user": "root",
+                    "mode": "MODULE",
+                    "remotehost": "root@192.168.0.10",
+                    "compress": true,
+                    "archive": true,
+                    "direction": "PULL",
+                    "path": "/mnt/vol1/rsync_dataset",
+                    "remotemodule": "remote_module1"
+                }]
+            }
+        """
         verrors, data = await self.validate_rsync_task(data, 'rsync_task_create')
         if verrors:
             raise verrors
@@ -551,16 +534,20 @@ class RsyncTaskService(CRUDService):
             data,
             {'prefix': self._config.datastore_prefix}
         )
-        await self.middleware.call('service.reload', 'cron')
+        await self.middleware.call('service.restart', 'cron')
 
-        return data
+        return await self._get_instance(data['id'])
 
     @accepts(
         Int('id', validators=[Range(min=1)]),
         Patch('rsync_task_create', 'rsync_task_update', ('attr', {'update': True}))
     )
     async def do_update(self, id, data):
+        """
+        Update Rsync Task of `id`.
+        """
         old = await self.query(filters=[('id', '=', id)], options={'get': True})
+        old.pop('job')
 
         new = old.copy()
         new.update(data)
@@ -578,12 +565,105 @@ class RsyncTaskService(CRUDService):
             new,
             {'prefix': self._config.datastore_prefix}
         )
-        await self.middleware.call('service.reload', 'cron')
+        await self.middleware.call('service.restart', 'cron')
 
         return await self.query(filters=[('id', '=', id)], options={'get': True})
 
     @accepts(Int('id'))
     async def do_delete(self, id):
+        """
+        Delete Rsync Task of `id`.
+        """
         res = await self.middleware.call('datastore.delete', self._config.datastore, id)
-        await self.middleware.call('service.reload', 'cron')
+        await self.middleware.call('service.restart', 'cron')
         return res
+
+    @private
+    async def commandline(self, id):
+        """
+        Helper method to generate the rsync command avoiding code duplication.
+        """
+        rsync = await self._get_instance(id)
+        path = shlex.quote(rsync['path'])
+
+        line = [
+            '/usr/bin/lockf', '-s', '-t', '0', '-k', path, '/usr/local/bin/rsync'
+        ]
+        for name, flag in (
+            ('archive', '-a'),
+            ('compress', '-z'),
+            ('delayupdates', '--delay-updates'),
+            ('delete', '--delete-delay'),
+            ('preserveattr', '-X'),
+            ('preserveperm', '-p'),
+            ('recursive', '-r'),
+            ('times', '-t'),
+        ):
+            if rsync[name]:
+                line.append(flag)
+        if rsync['extra']:
+            line.append(' '.join(rsync['extra']))
+
+        # Do not use username if one is specified in host field
+        # See #5096 for more details
+        if '@' in rsync['remotehost']:
+            remote = rsync['remotehost']
+        else:
+            remote = f'"{rsync["user"]}"@{rsync["remotehost"]}'
+
+        if rsync['mode'] == 'MODULE':
+            module_args = [path, f'{remote}::"{rsync["remotemodule"]}"']
+            if rsync['direction'] != 'PUSH':
+                module_args.reverse()
+            line += module_args
+        else:
+            line += [
+                '-e',
+                f'"ssh -p {rsync["remoteport"]} -o BatchMode=yes -o StrictHostKeyChecking=yes"'
+            ]
+            path_args = [path, f'{remote}:"{shlex.quote(rsync["remotepath"])}"']
+            if rsync['direction'] != 'PUSH':
+                path_args.reverse()
+            line += path_args
+
+        if rsync['quiet']:
+            line += ['>', '/dev/null', '2>&1']
+
+        return ' '.join(line)
+
+    @item_method
+    @accepts(Int('id'))
+    @job(lock=lambda args: args[-1], logs=True)
+    def run(self, job, id):
+        """
+        Job to run rsync task of `id`.
+
+        Output is saved to job log excerpt as well as syslog.
+        """
+        rsync = self.middleware.call_sync('rsynctask._get_instance', id)
+        commandline = self.middleware.call_sync('rsynctask.commandline', id)
+
+        cp = run_command_with_user_context(
+            commandline, rsync['user'], lambda v: job.logs_fd.write(v)
+        )
+
+        for klass in ('RsyncSuccess', 'RsyncFailed') if not rsync['quiet'] else ():
+            self.middleware.call_sync('alert.oneshot_delete', klass, rsync['id'])
+
+        if cp.returncode != 0:
+            if not rsync['quiet']:
+                self.middleware.call_sync('alert.oneshot_create', 'RsyncFailed', {
+                    'id': rsync['id'],
+                    'direction': rsync['direction'],
+                    'path': rsync['path'],
+                })
+
+            raise CallError(
+                f'rsync command returned {cp.returncode}. Check logs for further information.'
+            )
+        elif not rsync['quiet']:
+            self.middleware.call_sync('alert.oneshot_create', 'RsyncSuccess', {
+                'id': rsync['id'],
+                'direction': rsync['direction'],
+                'path': rsync['path'],
+            })

@@ -1,82 +1,53 @@
-#!/usr/local/bin/python3
+#!/usr/bin/env python3
 from middlewared.client import Client
 
 import asyncio
-import concurrent.futures
-from concurrent.futures.process import _process_worker
-import functools
-import importlib
-import logging
-import multiprocessing
+import inspect
+import os
 import setproctitle
+from . import logger
+from .utils import LoadPluginsMixin
+from .utils.io_thread_pool_executor import IoThreadPoolExecutor
+import middlewared.utils.osc as osc
+from .utils.run_in_thread import RunInThreadMixin
 
 MIDDLEWARE = None
 
 
-def _process_worker_wrapper(*args, **kwargs):
-    """
-    We need to define a wrapper to initialize the process
-    as soon as it is started to load everything we need
-    or the first call will take too long.
-    """
-    init()
-    return _process_worker(*args, **kwargs)
-
-
-class ProcessPoolExecutor(concurrent.futures.ProcessPoolExecutor):
-    def _adjust_process_count(self):
-        """
-        Method copied from concurrent.futures.ProcessPoolExecutor
-        replacing _process_worker with _process_worker_wrapper
-        """
-        for _ in range(len(self._processes), self._max_workers):
-            p = multiprocessing.Process(
-                target=_process_worker_wrapper,
-                args=(self._call_queue,
-                      self._result_queue))
-            p.start()
-            self._processes[p.pid] = p
-
-
-class FakeMiddleware(object):
+class FakeMiddleware(LoadPluginsMixin, RunInThreadMixin):
     """
     Implements same API from real middleware
     """
 
-    def __init__(self):
+    def __init__(self, overlay_dirs):
+        super().__init__(overlay_dirs)
         self.client = None
-        self.logger = logging.getLogger('worker')
+        self.logger = logger.Logger('worker')
+        self.logger.getLogger()
+        self.logger.configure_logging('console')
+        self.loop = asyncio.get_event_loop()
+        self.run_in_thread_executor = IoThreadPoolExecutor('IoThread', 1)
 
-    async def run_in_thread(self, method, *args, **kwargs):
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    async def _call(self, name, serviceobj, methodobj, params=None, app=None, pipes=None, io_thread=False, job=None):
         try:
-            return await asyncio.get_event_loop().run_in_executor(
-                executor, functools.partial(method, *args, **kwargs)
-            )
+            with Client('ws+unix:///var/run/middlewared-internal.sock', py_exceptions=True) as c:
+                self.client = c
+                job_options = getattr(methodobj, '_job', None)
+                if job and job_options:
+                    params = list(params) if params else []
+                    params.insert(0, FakeJob(job['id'], self.client))
+                if asyncio.iscoroutinefunction(methodobj):
+                    return await methodobj(*params)
+                else:
+                    return methodobj(*params)
         finally:
-            # We need this because default behavior of PoolExecutor with
-            # context manager is to shutdown(wait=True) which would block
-            # the worker until thread finishes.
-            executor.shutdown(wait=False)
+            self.client = None
 
-    async def _call(self, name, serviceobj, methodobj, params=None, app=None, pipes=None, spawn_thread=True, job=None):
-        with Client() as c:
-            self.client = c
-            job_options = getattr(methodobj, '_job', None)
-            if job and job_options:
-                params = list(params) if params else []
-                params.insert(0, FakeJob(job['id'], self.client))
-            if asyncio.iscoroutinefunction(methodobj):
-                return await methodobj(*params)
-            else:
-                return methodobj(*params)
-        self.client = None
-
-    async def _run(self, service_mod, service_name, method, args, job=None):
-        module = importlib.import_module(service_mod)
-        serviceobj = getattr(module, service_name)(self)
+    async def _run(self, name, args, job=None):
+        service, method = name.rsplit('.', 1)
+        serviceobj = self.get_service(service)
         methodobj = getattr(serviceobj, method)
-        return await self._call(f'{service_name}.{method}', serviceobj, methodobj, params=args, job=job)
+        return await self._call(name, serviceobj, methodobj, params=args, job=job)
 
     async def call(self, method, *params, timeout=None, **kwargs):
         """
@@ -89,6 +60,14 @@ class FakeMiddleware(object):
         Calls a method using middleware client
         """
         return self.client.call(method, *params, timeout=timeout, **kwargs)
+
+    async def call_hook(self, name, *args, **kwargs):
+        with Client(py_exceptions=True) as c:
+            return c.call('core.call_hook', name, args, kwargs)
+
+    def send_event(self, name, event_type, **kwargs):
+        with Client(py_exceptions=True) as c:
+            return c.call('core.event_send', name, event_type, kwargs)
 
 
 class FakeJob(object):
@@ -119,10 +98,19 @@ def main_worker(*call_args):
         res = loop.run_until_complete(coro)
     except SystemExit:
         raise RuntimeError('Worker call raised SystemExit exception')
+    # TODO: python cant pickle generator for obvious reasons, we should implement
+    # it using Pipe.
+    if inspect.isgenerator(res):
+        res = list(res)
     return res
 
 
-def init():
+def worker_init(overlay_dirs, debug_level, log_handler):
     global MIDDLEWARE
-    MIDDLEWARE = FakeMiddleware()
+    MIDDLEWARE = FakeMiddleware(overlay_dirs)
+    os.environ['MIDDLEWARED_LOADING'] = 'True'
+    MIDDLEWARE._load_plugins()
+    os.environ['MIDDLEWARED_LOADING'] = 'False'
     setproctitle.setproctitle('middlewared (worker)')
+    osc.die_with_parent()
+    logger.setup_logging('worker', debug_level, log_handler)

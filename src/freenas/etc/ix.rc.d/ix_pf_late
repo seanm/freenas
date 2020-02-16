@@ -2,9 +2,14 @@
 #
 # $FreeBSD$
 #
+# Copyright (c) 2015 iXsystems, Inc.
+# All rights reserved.
+# This file is a part of TrueNAS
+# and may not be copied and/or distributed
+# without the express permission of iXsystems.
 
 # PROVIDE: ix_pf_late
-# REQUIRE: ix-smbpasswd
+# AFTER: bgfsck
 # KEYWORD: nojail shutdown
 
 . /etc/rc.subr
@@ -12,17 +17,16 @@
 name="ix_pf_late"
 start_cmd="ix_pf_late_start"
 stop_cmd="ix_pf_late_stop"
-stop_cmd=":"
 
 
 ix_pf_late_start()
 {
-	/sbin/ipfw -f flush
+	checkyesno failover_enable || /sbin/pfctl -d
 }
 
 ix_pf_late_stop()
 {
-	/bin/sh /etc/ipfw.conf.block
+	checkyesno failover_enable || /sbin/pfctl -e /etc/pf.conf.block
 }
 
 run_rc_command "$1"

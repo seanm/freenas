@@ -2,6 +2,24 @@ import asyncio
 import threading
 
 
+class Events(object):
+
+    def __init__(self):
+        self.__events = {}
+
+    def register(self, name, description):
+        if name in self.__events:
+            raise ValueError(f'Event {name!r} already registered.')
+        self.__events[name] = description
+
+    def __contains__(self, name):
+        return name in self.__events
+
+    def __iter__(self):
+        for k, v in self.__events.items():
+            yield k, {'description': v, 'wildcard_subscription': True}
+
+
 class EventSource(object):
 
     def __init__(self, middleware, app, ident, name, arg):
@@ -16,7 +34,14 @@ class EventSource(object):
         self.app.send_event(self.name, etype, **kwargs)
 
     def process(self):
-        self.run()
+        try:
+            self.run()
+        except Exception:
+            self.middleware.logger.warning('EventSource %r run() failed', self.name, exc_info=True)
+        try:
+            self.on_finish()
+        except Exception:
+            self.middleware.logger.warning('EventSource %r on_finish() failed', self.name, exc_info=True)
         asyncio.run_coroutine_threadsafe(self.app.unsubscribe(self.ident), self.app.loop)
 
     def run(self):
@@ -24,3 +49,6 @@ class EventSource(object):
 
     def cancel(self):
         self._cancel.set()
+
+    def on_finish(self):
+        pass

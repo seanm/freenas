@@ -3,9 +3,9 @@
         def __init__(self, **kwargs):
             self.middleware = kwargs.get('middleware')
             self.pam_mkhomedir = "/usr/local/lib/pam_mkhomedir.so"
-            self.pam_sss = "/usr/local/lib/pam_sss.so"
             self.pam_ldap = "/usr/local/lib/pam_ldap.so"
             self.pam_winbind = "/usr/local/lib/pam_winbind.so"
+            self.pam_krb5 = "pam_krb5.so"
 
         def safe_call(self, *args):
             try: 
@@ -41,7 +41,7 @@
             return 'ActiveDirectory'
 
         def enabled(self):
-            return self.safe_call('notifier.common', 'system', 'activedirectory_enabled') 
+            return self.safe_call('activedirectory.config')['enable']
 
         def pam_auth(self):
             module = self.pam_winbind
@@ -76,51 +76,57 @@
             return 'LDAP'
 
         def enabled(self):
-            return self.safe_call('notifier.common', 'system', 'ldap_enabled')
+            return self.safe_call('ldap.config')['enable']
 
-        def __anonymous_bind(self):
-            return self.safe_call('notifier.common', 'system', 'ldap_anonymous_bind')
+        def is_kerberized(self):
+            return True if (self.safe_call('ldap.config'))['kerberos_realm'] else False
 
         def pam_auth(self):
-            module = self.pam_sss
-            args = ["ignore_authinfo_unavail", "quiet"]
-
-            if self.__anonymous_bind():
-                module = self.pam_ldap
-                args = ["try_first_pass", "ignore_unknown_user",
-                    "ignore_authinfo_unavail", "no_warn"]
+            module = self.pam_ldap
+            args = ["try_first_pass", "ignore_unknown_user",
+                "ignore_authinfo_unavail", "no_warn"]
+            krb5_args = ["try_first_pass", "no_warn"]
 
             module_args = " ".join(args)
 
-            return f"auth\t\tsufficient\t{module}\t{module_args}"
+            ldap_entry = f"auth\t\tsufficient\t{module}\t{module_args}"
+            krb5_entry = f"auth\t\tsufficient\t{self.pam_krb5}\t\t{' '.join(krb5_args)}"
+            if self.is_kerberized:
+                return f"{krb5_entry}\n{ldap_entry}"
+            else:
+                return ldap_entry
 
         def pam_account(self):
-            module = self.pam_sss
-            args = ["ignore_authinfo_unavail", "quiet"]
-
-            if self.__anonymous_bind():
-                module = self.pam_ldap
-                args = ["ignore_unknown_user", "ignore_authinfo_unavail", "no_warn"]
+            module = self.pam_ldap
+            args = ["ignore_unknown_user", "ignore_authinfo_unavail", "no_warn"]
+            krb5_args = ["no_warn"]
 
             module_args = " ".join(args)
 
-            return f"account\t\tsufficient\t{module}\t{module_args}"
+            ldap_entry = f"account\t\tsufficient\t{module}\t{module_args}"
+            krb5_entry = f"account\t\tsufficient\t{self.pam_krb5}\t\t{' '.join(krb5_args)}"
+            if self.is_kerberized:
+                return f"{krb5_entry}\n{ldap_entry}"
+            else:
+                return ldap_entry
 
         def pam_session(self):
             return f"session\t\trequired\t{self.pam_mkhomedir}"
 
         def pam_password(self):
-            module = self.pam_sss
-            args = ["use_authtok", "quiet"]
-
-            if self.__anonymous_bind():
-                module = self.pam_ldap
-                args = ["use_authtok", "ignore_unknown_user",
-                    "ignore_authinfo_unavail", "no_warn"]
+            module = self.pam_ldap
+            args = ["use_authtok", "ignore_unknown_user",
+                "ignore_authinfo_unavail", "no_warn"]
+            krb5_args = ["try_first_pass", "no_warn"]
 
             module_args = " ".join(args)
 
-            return f"password\tsufficient\t{module}\t{module_args}"
+            ldap_entry = f"password\tsufficient\t{module}\t{module_args}"
+            krb5_entry = f"password\t\tsufficient\t{self.pam_krb5}\t\t{' '.join(krb5_args)}"
+            if self.is_kerberized:
+                return f"{krb5_entry}\n{ldap_entry}"
+            else:
+                return ldap_entry
 
 
     class NISPam(DirectoryServicePamBase):
@@ -131,18 +137,7 @@
             return 'NIS'
 
         def enabled(self):
-            return self.safe_call('notifier.common', 'system', 'nis_enabled')
-
-
-    class DCPam(ActiveDirectoryPam):
-        def __init__(self, **kwargs):
-            super(DCPam, self).__init__(**kwargs)
-
-        def name(self):
-            return 'DC'
-
-        def enabled(self):
-            return self.safe_call('notifier.common', 'system', 'domaincontroller_enabled')
+            return self.safe_call('nis.config')['enable']
 
 
     class DirectoryServicePam(DirectoryServicePamBase):
@@ -156,14 +151,12 @@
                     obj = LDAPPam(**kwargs)
                 elif NISPam(**kwargs).enabled():
                     obj = NISPam(**kwargs)
-                elif DCPam(**kwargs).enabled():
-                    obj = DCPam(**kwargs) 
             except Exception as e:
                 obj = None
 
             if not obj:
                 obj = DirectoryServicePamBase()
-           
+
             return obj
 %>
 <%def name="getDirectoryServicePam(**kwargs)">

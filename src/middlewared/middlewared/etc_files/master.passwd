@@ -1,4 +1,4 @@
-% for user in middleware.call_sync('datastore.query', 'account.bsdusers', [], {'prefix': 'bsdusr_', 'order_by': ['-builtin', 'uid']}):
+% for user in middleware.call_sync('user.query', [], {'order_by': ['-builtin', 'uid']}):
 <%
 if user['password_disabled']:
     passwd = "*"
@@ -7,9 +7,10 @@ elif user['locked']:
 else:
     passwd = user['unixhash']
 %>
-${user['username']}:${passwd}:${user['uid']}:${user['group']['id']}::0:0:${user['full_name']}:${user['home']}:${user['shell']}\
+${user['username']}:${passwd}:${user['uid']}:${user['group']['bsdgrp_gid']}::0:0:${user['full_name']}:${user['home']}:${user['shell']}\
 % endfor
-% if middleware.call_sync('notifier.common', 'system', 'nis_enabled'):
+% if middleware.call_sync('nis.config')['enable']:
+
 +:::::::::\
 % endif
 

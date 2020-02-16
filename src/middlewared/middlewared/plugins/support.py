@@ -1,36 +1,120 @@
 import errno
 import json
-import os
 import requests
-import shutil
 import simplejson
 import socket
 import subprocess
-import sys
 import time
 
 from middlewared.pipe import Pipes
-from middlewared.schema import Bool, Dict, Int, Str, accepts
-from middlewared.service import CallError, Service, job
+from middlewared.schema import Bool, Dict, Int, List, Str, accepts
+from middlewared.service import CallError, ConfigService, job, ValidationErrors
+import middlewared.sqlalchemy as sa
 from middlewared.utils import Popen
-
-# FIXME: Remove when we can generate debug and move license to middleware
-if '/usr/local/www' not in sys.path:
-    sys.path.append('/usr/local/www')
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'freenasUI.settings')
-
-import django
-from django.apps import apps
-if not apps.ready:
-    django.setup()
-
-from freenasUI.system.utils import debug_get_settings, debug_generate
-from freenasUI.support.utils import get_license
+from middlewared.validators import Email
 
 ADDRESS = 'support-proxy.ixsystems.com'
 
 
-class SupportService(Service):
+class SupportModel(sa.Model):
+    __tablename__ = 'system_support'
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    enabled = sa.Column(sa.Boolean(), nullable=True, default=True)
+    name = sa.Column(sa.String(200))
+    title = sa.Column(sa.String(200))
+    email = sa.Column(sa.String(200))
+    phone = sa.Column(sa.String(200))
+    secondary_name = sa.Column(sa.String(200))
+    secondary_title = sa.Column(sa.String(200))
+    secondary_email = sa.Column(sa.String(200))
+    secondary_phone = sa.Column(sa.String(200))
+
+
+class SupportService(ConfigService):
+
+    class Config:
+        datastore = 'system.support'
+
+    @accepts(Dict(
+        'support_update',
+        Bool('enabled', null=True),
+        Str('name'),
+        Str('title'),
+        Str('email'),
+        Str('phone'),
+        Str('secondary_name'),
+        Str('secondary_title'),
+        Str('secondary_email'),
+        Str('secondary_phone'),
+        update=True
+    ))
+    async def do_update(self, data):
+        """
+        Update Proactive Support settings.
+        """
+
+        config_data = await self.config()
+        config_data.update(data)
+
+        verrors = ValidationErrors()
+        if config_data['enabled']:
+            for key in ['name', 'title', 'email', 'phone']:
+                for prefix in ['', 'secondary_']:
+                    field = prefix + key
+                    if not config_data[field]:
+                        verrors.add(f'support_update.{field}', 'This field is required')
+        if verrors:
+            raise verrors
+
+        await self.middleware.call(
+            'datastore.update',
+            self._config.datastore,
+            config_data['id'],
+            config_data,
+        )
+
+        return await self.config()
+
+    @accepts()
+    async def is_available(self):
+        """
+        Returns whether Proactive Support is available for this product type and current license.
+        """
+
+        if await self.middleware.call('system.is_freenas'):
+            return False
+
+        license = (await self.middleware.call('system.info'))['license']
+        if license is None:
+            return False
+
+        return license['contract_type'] in ['SILVER', 'GOLD']
+
+    @accepts()
+    async def is_available_and_enabled(self):
+        """
+        Returns whether Proactive Support is available and enabled.
+        """
+
+        return await self.is_available() and (await self.config())['enabled']
+
+    @accepts()
+    async def fields(self):
+        """
+        Returns list of pairs of field names and field titles for Proactive Support.
+        """
+
+        return (
+            ("name", "Contact Name"),
+            ("title", "Contact Title"),
+            ("email", "Contact E-mail"),
+            ("phone", "Contact Phone"),
+            ("secondary_name", "Secondary Contact Name"),
+            ("secondary_title", "Secondary Contact Title"),
+            ("secondary_email", "Secondary Contact E-mail"),
+            ("secondary_phone", "Secondary Contact Phone"),
+        )
 
     @accepts(
         Str('username'),
@@ -69,18 +153,19 @@ class SupportService(Service):
 
     @accepts(Dict(
         'new_ticket',
-        Str('title', required=True),
-        Str('body', required=True),
+        Str('title', required=True, max_length=None),
+        Str('body', required=True, max_length=None),
         Str('category', required=True),
         Bool('attach_debug', default=False),
         Str('username', private=True),
         Str('password', private=True),
         Str('type', enum=['BUG', 'FEATURE']),
         Str('criticality'),
-        Str('environment'),
+        Str('environment', max_length=None),
         Str('phone'),
         Str('name'),
-        Str('email'),
+        Str('email', validators=[Email()]),
+        List('cc', items=[Str('email', validators=[Email()])])
     ))
     @job()
     async def new_ticket(self, job, data):
@@ -102,9 +187,9 @@ class SupportService(Service):
         else:
             required_attrs = ('phone', 'name', 'email', 'criticality', 'environment')
             data['serial'] = (await (await Popen(['/usr/local/sbin/dmidecode', '-s', 'system-serial-number'], stdout=subprocess.PIPE)).communicate())[0].decode().split('\n')[0].upper()
-            license = get_license()[0]
+            license = (await self.middleware.call('system.info'))['license']
             if license:
-                data['company'] = license.customer_name
+                data['company'] = license['customer_name']
             else:
                 data['company'] = 'Unknown'
 
@@ -153,30 +238,24 @@ class SupportService(Service):
         job.set_progress(50, f'Ticket created: {ticket}', extra={'ticket': ticket})
 
         if debug:
-            # FIXME: generate debug from middleware
-            mntpt, direc, dump = await self.middleware.run_in_thread(debug_get_settings)
-
             job.set_progress(60, 'Generating debug file')
-            await self.middleware.run_in_thread(debug_generate)
+
+            debug_job = await self.middleware.call(
+                'system.debug', pipes=Pipes(output=self.middleware.pipe()),
+            )
 
             not_freenas = not (await self.middleware.call('system.is_freenas'))
             if not_freenas:
-                not_freenas &= await self.middleware.call('notifier.failover_licensed')
+                not_freenas &= await self.middleware.call('failover.licensed')
             if not_freenas:
-                debug_file = f'{direc}/debug.tar'
                 debug_name = 'debug-{}.tar'.format(time.strftime('%Y%m%d%H%M%S'))
             else:
-                debug_file = dump
                 debug_name = 'debug-{}-{}.txz'.format(
                     socket.gethostname().split('.')[0],
                     time.strftime('%Y%m%d%H%M%S'),
                 )
 
             job.set_progress(80, 'Attaching debug file')
-
-            # 20M filesize limit
-            if os.path.getsize(debug_file) > 20971520:
-                raise CallError('Debug too large to attach', errno.EFBIG)
 
             t = {
                 'ticket': ticket,
@@ -186,12 +265,27 @@ class SupportService(Service):
                 t['username'] = data['user']
             if 'password' in data:
                 t['password'] = data['password']
-            tjob = await self.middleware.call('support.attach_ticket', t, pipes=Pipes(input=self.middleware.pipe()))
+            tjob = await self.middleware.call(
+                'support.attach_ticket', t, pipes=Pipes(input=self.middleware.pipe()),
+            )
 
-            with open(debug_file, 'rb') as f:
-                await self.middleware.run_in_io_thread(shutil.copyfileobj, f, tjob.pipes.input.w)
-                await self.middleware.run_in_io_thread(tjob.pipes.input.w.close)
+            def copy():
+                try:
+                    rbytes = 0
+                    while True:
+                        r = debug_job.pipes.output.r.read(1048576)
+                        if r == b'':
+                            break
+                        rbytes += len(r)
+                        if rbytes > 20971520:
+                            raise CallError('Debug too large to attach', errno.EFBIG)
+                        tjob.pipes.input.w.write(r)
+                finally:
+                    tjob.pipes.input.w.close()
 
+            await self.middleware.run_in_thread(copy)
+
+            await debug_job.wait()
             await tjob.wait()
         else:
             job.set_progress(100)
@@ -204,9 +298,9 @@ class SupportService(Service):
     @accepts(Dict(
         'attach_ticket',
         Int('ticket', required=True),
-        Str('filename', required=True),
-        Str('username'),
-        Str('password'),
+        Str('filename', required=True, max_length=None),
+        Str('username', private=True),
+        Str('password', private=True),
     ))
     @job(pipes=["input"])
     async def attach_ticket(self, job, data):
@@ -222,10 +316,10 @@ class SupportService(Service):
         filename = data.pop('filename')
 
         try:
-            r = await self.middleware.run_in_io_thread(lambda: requests.post(
+            r = await self.middleware.run_in_thread(lambda: requests.post(
                 f'https://{ADDRESS}/{sw_name}/api/v1.0/ticket/attachment',
                 data=data,
-                timeout=10,
+                timeout=300,
                 files={'file': (filename, job.pipes.input.r)},
             ))
             data = r.json()

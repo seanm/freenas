@@ -5,35 +5,33 @@ except ImportError:
     import sys
     print("fastentrypoints module not found. entry points will be slower.", file=sys.stderr)
 from setuptools import find_packages, setup
+from setuptools.command.install import install
+
+from babel.messages import frontend as babel
 
 
-install_requires = [
-    'ws4py',
-    'python-dateutil',
-    'aiohttp_wsgi',
-    'markdown',
-    'Flask',
-    'setproctitle',
-    'psutil',
-]
-
-
-def get_etc_files(*args, **kwargs):
+def get_assets(name):
     """
-    Recursive get dirs from middlewared/etc_files/.
-    This is required for the etc plugin.
+    Recursive get dirs from middlewared/{name}
     """
     base_path = os.path.join(
         os.path.dirname(os.path.realpath(__file__)),
         'middlewared',
-        'etc_files',
     )
-    for root, dirs, files in os.walk(base_path):
-        if base_path == root:
-            yield 'etc_files/*'
-        else:
-            entry = root.replace(base_path, 'etc_files')
-            yield f'{entry}/*'
+    result = []
+    for root, dirs, files in os.walk(os.path.join(base_path, name)):
+        result.append(f'{os.path.relpath(root, base_path)}/*')
+    return result
+
+
+class InstallWithBabel(install):
+    def run(self):
+        compiler = babel.compile_catalog(self.distribution)
+        option_dict = self.distribution.get_option_dict('compile_catalog')
+        compiler.domain = [option_dict['domain'][1]]
+        compiler.directory = option_dict['directory'][1]
+        compiler.run()
+        super().run()
 
 
 setup(
@@ -45,7 +43,13 @@ setup(
             'templates/websocket/*',
             'templates/*.*',
         ],
-        'middlewared': get_etc_files(),
+        'middlewared': (
+            get_assets('alembic') +
+            ['alembic.ini'] +
+            get_assets('assets') +
+            get_assets('etc_files') +
+            get_assets('migration')
+        ),
     },
     include_package_data=True,
     license='BSD',
@@ -57,13 +61,21 @@ setup(
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
     ],
-    install_requires=install_requires,
     entry_points={
         'console_scripts': [
+            'hadetect = middlewared.scripts.hadetect:main',
             'middlewared = middlewared.main:main',
             'midclt = middlewared.client.client:main',
             'midgdb = middlewared.scripts.gdb:main',
             'sedhelper = middlewared.scripts.sedhelper:main',
         ],
+    },
+    cmdclass={
+        'install': InstallWithBabel,
+
+        'compile_catalog': babel.compile_catalog,
+        'extract_messages': babel.extract_messages,
+        'init_catalog': babel.init_catalog,
+        'update_catalog': babel.update_catalog,
     },
 )

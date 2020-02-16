@@ -33,6 +33,38 @@ smart_directory() { echo "SMART"; }
 smart_func()
 {
 
+	local smart_onoff=0
+	local smart_enabled="not start on boot."
+
+	smart_onoff=$(${FREENAS_SQLITE_CMD} ${FREENAS_CONFIG} "
+	SELECT
+		srv_enable
+	FROM
+		services_services
+	WHERE
+		srv_service = 'smartd'
+	ORDER BY
+		-id
+	LIMIT 1
+	")
+
+	if [ "$smart_onoff" = "1" ]
+	then
+		smart_enabled="start on boot."
+	fi
+
+	section_header "SMARTD Boot Status"
+	echo "SMARTD will $smart_enabled"
+	section_footer
+
+	section_header "SMARTD Run Status"
+	if is_linux; then
+		systemctl status smartd
+	else
+		service smartd-daemon onestatus
+	fi
+	section_footer
+
 	section_header "Scheduled SMART Jobs"
 	${FREENAS_SQLITE_CMD} ${FREENAS_CONFIG} -line "
 	SELECT *
@@ -51,11 +83,19 @@ smart_func()
 
 	section_header "smartctl -a"
 	if [ -f /tmp/smart.out ]; then
-		rm -rf /tmp/smart.out
+		rm -f /tmp/smart.out
 	fi
-	for i in `sysctl -n kern.disks`
+
+	if is_linux; then
+		disks=$(lsblk -ndo name | grep -v '^sr')
+	else
+		disks=$(sysctl -n kern.disks)
+	fi
+
+	for i in $disks
 	do
-    		smartctl -a /dev/$i >> /tmp/smart.out
+    		echo /dev/$i >> /tmp/smart.out
+		smartctl -a /dev/$i >> /tmp/smart.out
 	done
 	cat /tmp/smart.out
 	${FREENAS_DEBUG_MODULEDIR}/smart/smart.nawk < /tmp/smart.out

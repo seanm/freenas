@@ -1,21 +1,27 @@
-import os
 import logging
-import logging.handlers
-
 from logging.config import dictConfig
+import logging.handlers
+import os
+import sys
+
+import sentry_sdk
+
 from .utils import sw_version, sw_version_is_stable
 
-from raven import Client
-from raven.transport.threaded import ThreadedHTTPTransport
 
 # markdown debug is also considered useless
 logging.getLogger('MARKDOWN').setLevel(logging.INFO)
 # asyncio runs in debug mode but we do not need INFO/DEBUG
 logging.getLogger('asyncio').setLevel(logging.WARN)
+# We dont need internal aiohttp debug logging
+logging.getLogger('aiohttp.internal').setLevel(logging.WARN)
 # we dont need ws4py close debug messages
 logging.getLogger('ws4py').setLevel(logging.WARN)
+# we dont need GitPython debug messages (used in iocage)
+logging.getLogger('git.cmd').setLevel(logging.WARN)
 
 LOGFILE = '/var/log/middlewared.log'
+ZETTAREPL_LOGFILE = '/var/log/zettarepl.log'
 logging.TRACE = 6
 
 
@@ -29,28 +35,31 @@ logging.Logger.trace = trace
 
 
 class CrashReporting(object):
+    enabled_in_settings = False
+
     """
     Pseudo-Class for remote crash reporting
     """
 
-    def __init__(self, transport='threaded'):
-        if transport == 'threaded':
-            transport = ThreadedHTTPTransport
-        else:
-            raise ValueError(f'Unknown transport: {transport}')
-
+    def __init__(self):
         if sw_version_is_stable():
             self.sentinel_file_path = '/tmp/.crashreporting_disabled'
         else:
             self.sentinel_file_path = '/data/.crashreporting_disabled'
         self.logger = logging.getLogger('middlewared.logger.CrashReporting')
-        self.client = Client(
-            dsn='https://11101daa5d5643fba21020af71900475:d60cd246ba684afbadd479653de2c216@sentry.ixsystems.com/2?timeout=3',
-            install_sys_hook=False,
-            install_logging_hook=False,
-            string_max_length=10240,
+        sentry_sdk.init(
+            'https://11101daa5d5643fba21020af71900475:d60cd246ba684afbadd479653de2c216@sentry.ixsystems.com/2?timeout=3',
             release=sw_version(),
+            integrations=[],
+            default_integrations=False,
         )
+        sentry_sdk.utils.MAX_STRING_LENGTH = 10240
+        # FIXME: remove this when 0.10.3 is released
+        strip_string = sentry_sdk.utils.strip_string
+        sentry_sdk.utils.strip_string = lambda s: strip_string(s, sentry_sdk.utils.MAX_STRING_LENGTH)
+        sentry_sdk.utils.slim_string = sentry_sdk.utils.strip_string
+        sentry_sdk.serializer.strip_string = sentry_sdk.utils.strip_string
+        sentry_sdk.serializer.slim_string = sentry_sdk.utils.strip_string
 
     def is_disabled(self):
         """
@@ -64,12 +73,15 @@ class CrashReporting(object):
         # if FreeNAS current train is STABLE, the sentinel file path will be /tmp/,
         # otherwise it's path will be /data/ and can be persistent.
 
+        if not self.enabled_in_settings:
+            return True
+
         if os.path.exists(self.sentinel_file_path) or 'CRASHREPORTING_DISABLED' in os.environ:
             return True
         else:
             return False
 
-    def report(self, exc_info, data, t_log_files):
+    def report(self, exc_info, log_files):
         """"
         Args:
             exc_info (tuple): Same as sys.exc_info().
@@ -80,25 +92,24 @@ class CrashReporting(object):
         if self.is_disabled():
             return
 
-        extra_data = {}
-        if all(t_log_files):
-            payload_size = 0
-            for path, name in t_log_files:
-                if os.path.exists(path):
-                    with open(path, 'r') as absolute_file_path:
-                        contents = absolute_file_path.read()[-10240:]
-                        # There is a limit for the whole report payload.
-                        # Lets skip the file if its hits areasonable limit.
-                        if len(contents) + payload_size > 61440:
-                            continue
-                        extra_data[name] = contents
-                        payload_size += len(contents)
+        data = {}
+        for path, name in log_files:
+            if os.path.exists(path):
+                with open(path, 'r') as absolute_file_path:
+                    contents = absolute_file_path.read()[-10240:]
+                    data[name] = contents
 
         self.logger.debug('Sending a crash report...')
         try:
-            self.client.captureException(exc_info=exc_info, data=data, extra=extra_data)
+            with sentry_sdk.configure_scope() as scope:
+                payload_size = 0
+                for k, v in data.items():
+                    if payload_size + len(v) < 190000:
+                        scope.set_extra(k, v)
+                        payload_size += len(v)
+                sentry_sdk.capture_exception(exc_info)
         except Exception:
-            pass  # We don't care about the exception
+            self.logger.debug('Failed to send crash report', exc_info=True)
 
 
 class LoggerFormatter(logging.Formatter):
@@ -158,53 +169,102 @@ class LoggerStream(object):
             self.logger.debug(line.rstrip())
 
 
+class ErrorProneRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def handleError(self, record):
+        try:
+            super().handleError(record)
+        except ValueError:
+            # sys.stderr can be closed by core.reconfigure_logging which leads to
+            # ValueError: I/O operation on closed file. raised on every operation that
+            # involves logging
+            pass
+
+
 class Logger(object):
     """Pseudo-Class for Logger - Wrapper for logging module"""
-    DEFAULT_LOGGING = {
-        'version': 1,
-        'disable_existing_loggers': True,
-        'root': {
-            'level': 'NOTSET',
-            'handlers': ['file'],
-        },
-        'handlers': {
-            'file': {
-                'level': 'DEBUG',
-                'class': 'logging.handlers.RotatingFileHandler',
-                'filename': LOGFILE,
-                'mode': 'a',
-                'maxBytes': 10485760,
-                'backupCount': 5,
-                'encoding': 'utf-8',
-                'formatter': 'file',
-            },
-        },
-        'formatters': {
-            'file': {
-                'format': '[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s',
-                'datefmt': '%Y/%m/%d %H:%M:%S',
-            },
-        },
-    }
-
-    def __init__(self, application_name, debug_level=None):
+    def __init__(
+        self, application_name, debug_level=None,
+        log_format='[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s'
+    ):
         self.application_name = application_name
         self.debug_level = debug_level or 'DEBUG'
+        self.log_format = log_format
+
+        self.DEFAULT_LOGGING = {
+            'version': 1,
+            'disable_existing_loggers': False,
+            'loggers': {
+                '': {
+                    'level': 'NOTSET',
+                    'handlers': ['file'],
+                },
+                'zettarepl': {
+                    'level': 'NOTSET',
+                    'handlers': ['zettarepl_file'],
+                    'propagate': False,
+                },
+            },
+            'handlers': {
+                'file': {
+                    'level': 'DEBUG',
+                    'class': 'middlewared.logger.ErrorProneRotatingFileHandler',
+                    'filename': LOGFILE,
+                    'mode': 'a',
+                    'maxBytes': 10485760,
+                    'backupCount': 5,
+                    'encoding': 'utf-8',
+                    'formatter': 'file',
+                },
+                'zettarepl_file': {
+                    'level': 'DEBUG',
+                    'class': 'middlewared.logger.ErrorProneRotatingFileHandler',
+                    'filename': ZETTAREPL_LOGFILE,
+                    'mode': 'a',
+                    'maxBytes': 10485760,
+                    'backupCount': 5,
+                    'encoding': 'utf-8',
+                    'formatter': 'zettarepl_file',
+                },
+            },
+            'formatters': {
+                'file': {
+                    'format': self.log_format,
+                    'datefmt': '%Y/%m/%d %H:%M:%S',
+                },
+                'zettarepl_file': {
+                    'format': '[%(asctime)s] %(levelname)-8s [%(threadName)s] [%(name)s] %(message)s',
+                    'datefmt': '%Y/%m/%d %H:%M:%S',
+                },
+            },
+        }
 
     def getLogger(self):
         return logging.getLogger(self.application_name)
 
     def stream(self):
-        return logging.root.handlers[0].stream
+        for handler in logging.root.handlers:
+            if isinstance(handler, ErrorProneRotatingFileHandler):
+                return handler.stream
 
     def _set_output_file(self):
         """Set the output format for file log."""
-        dictConfig(self.DEFAULT_LOGGING)
+        try:
+            dictConfig(self.DEFAULT_LOGGING)
+        except Exception:
+            # If something happens during system dataset reconfiguration, we have the chance of not having
+            # /var/log present leaving us with "ValueError: Unable to configure handler 'file':
+            # [Errno 2] No such file or directory: '/var/log/middlewared.log'"
+            # crashing the middleware during startup
+            pass
         # Make sure log file is not readable by everybody.
         # umask could be another approach but chmod was chosen so
         # it affects existing installs.
         try:
             os.chmod(LOGFILE, 0o640)
+        except OSError:
+            pass
+        try:
+            os.chmod(ZETTAREPL_LOGFILE, 0o640)
         except OSError:
             pass
 
@@ -213,10 +273,8 @@ class Logger(object):
 
         console_handler = logging.StreamHandler()
         logging.root.setLevel(getattr(logging, self.debug_level))
-
-        log_format = "[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s"
         time_format = "%Y/%m/%d %H:%M:%S"
-        console_handler.setFormatter(LoggerFormatter(log_format, datefmt=time_format))
+        console_handler.setFormatter(LoggerFormatter(self.log_format, datefmt=time_format))
 
         logging.root.addHandler(console_handler)
 
@@ -233,3 +291,18 @@ class Logger(object):
             self._set_output_file()
 
         logging.root.setLevel(getattr(logging, self.debug_level))
+
+
+def setup_logging(name, debug_level, log_handler):
+    _logger = Logger(name, debug_level)
+    _logger.getLogger()
+
+    if 'file' in log_handler:
+        _logger.configure_logging('file')
+        stream = _logger.stream()
+        if stream is not None:
+            sys.stdout = sys.stderr = stream
+    elif 'console' in log_handler:
+        _logger.configure_logging('console')
+    else:
+        _logger.configure_logging('file')

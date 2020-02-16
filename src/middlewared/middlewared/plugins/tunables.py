@@ -3,6 +3,19 @@ import re
 from middlewared.schema import (Bool, Dict, Int, Patch, Str, ValidationErrors,
                                 accepts)
 from middlewared.service import CRUDService, private
+import middlewared.sqlalchemy as sa
+from middlewared.validators import Match
+
+
+class TunableModel(sa.Model):
+    __tablename__ = 'system_tunable'
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    tun_value = sa.Column(sa.String(512))
+    tun_type = sa.Column(sa.String(20), default='loader')
+    tun_comment = sa.Column(sa.String(100))
+    tun_enabled = sa.Column(sa.Boolean(), default=True)
+    tun_var = sa.Column(sa.String(128))
 
 
 class TunableService(CRUDService):
@@ -13,7 +26,7 @@ class TunableService(CRUDService):
 
     @accepts(Dict(
         'tunable_create',
-        Str('var', required=True),
+        Str('var', validators=[Match(r'^[\w\.]+$')], required=True),
         Str('value', required=True),
         Str('type', enum=['LOADER', 'RC', 'SYSCTL'], required=True),
         Str('comment'),
@@ -21,6 +34,16 @@ class TunableService(CRUDService):
         register=True
     ))
     async def do_create(self, data):
+        """
+        Create a Tunable.
+
+        `var` represents name of the sysctl/loader/rc variable.
+
+        `type` should be one of the following:
+        1) LOADER     -     Configure `var` for loader(8)
+        2) RC         -     Configure `var` for rc(8)
+        3) SYSCTL     -     Configure `var` for sysctl(8)
+        """
         await self.clean(data, 'tunable_create')
         await self.validate(data, 'tunable_create')
         await self.lower(data)
@@ -45,6 +68,9 @@ class TunableService(CRUDService):
         )
     )
     async def do_update(self, id, data):
+        """
+        Update Tunable of `id`.
+        """
         old = await self._get_instance(id)
 
         new = old.copy()
@@ -69,12 +95,20 @@ class TunableService(CRUDService):
 
     @accepts(Int('id'))
     async def do_delete(self, id):
+        """
+        Delete Tunable of `id`.
+        """
+        tunable = await self._get_instance(id)
 
-        return await self.middleware.call(
+        response = await self.middleware.call(
             'datastore.delete',
             self._config.datastore,
             id
         )
+
+        await self.middleware.call('service.reload', tunable['type'].lower())
+
+        return response
 
     @private
     async def lower(self, data):

@@ -1,27 +1,67 @@
-from middlewared.alert.base import Alert, AlertLevel, AlertSource
+from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, AlertSource
+
+
+class SnapshotFailedAlertClass(AlertClass):
+    category = AlertCategory.TASKS
+    level = AlertLevel.CRITICAL
+    title = "Snapshot Task Failed"
+    text = "Snapshot Task For Dataset \"%(name)s\" failed: %(message)s."
+
+
+class ReplicationSuccessAlertClass(AlertClass):
+    category = AlertCategory.TASKS
+    level = AlertLevel.INFO
+    title = "Replication Succeeded"
+    text = "Replication \"%(name)s\" succeeded."
+
+
+class ReplicationFailedAlertClass(AlertClass):
+    category = AlertCategory.TASKS
+    level = AlertLevel.CRITICAL
+    title = "Replication Failed"
+    text = "Replication \"%(name)s\" failed: %(message)s."
 
 
 class ReplicationAlertSource(AlertSource):
-    level = AlertLevel.CRITICAL
-    title = "Replication failed"
-
     async def check(self):
         alerts = []
-        for replication in await self.middleware.call("replication.query", [["enabled", "=", True]]):
-            message = replication["lastresult"].get("msg")
-            if message in ("Succeeded", "Up to date", "Waiting", "Running", "", None):
-                continue
+        for snapshottask in await self.middleware.call("pool.snapshottask.query", [["enabled", "=", True]]):
+            if snapshottask["state"]["state"] == "ERROR":
+                alerts.append(
+                    Alert(
+                        SnapshotFailedAlertClass,
+                        {
+                            "name": snapshottask["dataset"],
+                            "message": snapshottask["state"]["error"],
+                        },
+                        key=[snapshottask["id"], snapshottask["state"]["datetime"].isoformat()],
+                        datetime=snapshottask["state"]["datetime"],
+                    )
+                )
 
-            alerts.append(Alert(
-                "Replication %(replication)s failed: %(message)s",
-                {
-                    "replication": "%s -> %s:%s" % (
-                        replication["filesystem"],
-                        replication["remote_hostname"],
-                        replication["zfs"],
-                    ),
-                    "message": message,
-                },
-            ))
+        for replication in await self.middleware.call("replication.query", [["enabled", "=", True]]):
+            if replication["state"]["state"] == "FINISHED":
+                alerts.append(
+                    Alert(
+                        ReplicationSuccessAlertClass,
+                        {
+                            "name": replication["name"],
+                        },
+                        key=[replication["id"], replication["state"]["datetime"].isoformat()],
+                        datetime=replication["state"]["datetime"],
+                    )
+                )
+            if replication["state"]["state"] == "ERROR":
+                alerts.append(
+                    Alert(
+                        ReplicationFailedAlertClass,
+                        {
+                            "name": replication["name"],
+                            "message": replication["state"]["error"],
+                        },
+                        key=[replication["id"], replication["state"]["datetime"].isoformat()],
+                        datetime=replication["state"]["datetime"],
+                    )
+                )
 
         return alerts

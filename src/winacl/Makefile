@@ -1,4 +1,4 @@
-NO_MAN=
+MK_MAN=	no
 
 .include <bsd.own.mk>
 

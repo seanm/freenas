@@ -1,7 +1,20 @@
 from middlewared.schema import accepts, Bool, Dict, Int, Str, Patch
 from middlewared.service import ValidationErrors, CRUDService, private
+import middlewared.sqlalchemy as sa
 
 import ntplib
+
+
+class NTPModel(sa.Model):
+    __tablename__ = 'system_ntpserver'
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    ntp_address = sa.Column(sa.String(120))
+    ntp_burst = sa.Column(sa.Boolean(), default=False)
+    ntp_iburst = sa.Column(sa.Boolean(), default=True)
+    ntp_prefer = sa.Column(sa.Boolean(), default=False)
+    ntp_minpoll = sa.Column(sa.Integer(), default=6)
+    ntp_maxpoll = sa.Column(sa.Integer(), default=10)
 
 
 class NTPServerService(CRUDService):
@@ -22,13 +35,32 @@ class NTPServerService(CRUDService):
         register=True
     ))
     async def do_create(self, data):
+        """
+        Add an NTP Server.
+
+        `address` specifies the hostname/IP address of the NTP server.
+
+        `burst` when enabled makes sure that if server is reachable, sends a burst of eight packets instead of one.
+        This is designed to improve timekeeping quality with the server command.
+
+        `iburst` when enabled speeds up the initial synchronization, taking seconds rather than minutes.
+
+        `prefer` marks the specified server as preferred. When all other things are equal, this host is chosen
+        for synchronization acquisition with the server command. It is recommended that they be used for servers with
+        time monitoring hardware.
+
+        `minpoll` is minimum polling time in seconds. It must be a power of 2 and less than `maxpoll`.
+
+        `maxpoll` is maximum polling time in seconds. It must be a power of 2 and greater than `minpoll`.
+
+        `force` when enabled forces the addition of NTP server even if it is currently unreachable.
+        """
         await self.clean(data, 'ntpserver_create')
 
         data['id'] = await self.middleware.call(
             'datastore.insert', self._config.datastore, data,
             {'prefix': self._config.datastore_prefix})
 
-        await self.middleware.call('service.start', 'ix-ntpd')
         await self.middleware.call('service.restart', 'ntpd')
 
         return data
@@ -42,6 +74,9 @@ class NTPServerService(CRUDService):
         )
     )
     async def do_update(self, id, data):
+        """
+        Update NTP server of `id`.
+        """
         old = await self._get_instance(id)
 
         new = old.copy()
@@ -53,15 +88,20 @@ class NTPServerService(CRUDService):
             'datastore.update', self._config.datastore, id, new,
             {'prefix': self._config.datastore_prefix})
 
-        await self.middleware.call('service.start', 'ix-ntpd')
         await self.middleware.call('service.restart', 'ntpd')
 
         return new
 
     @accepts(Int('id'))
     async def do_delete(self, id):
-        return await self.middleware.call(
-            'datastore.delete', self._config.datastore, id)
+        """
+        Delete NTP server of `id`.
+        """
+        response = await self.middleware.call('datastore.delete', self._config.datastore, id)
+
+        await self.middleware.call('service.restart', 'ntpd')
+
+        return response
 
 
     @private
@@ -84,7 +124,7 @@ class NTPServerService(CRUDService):
         maxpoll = data['maxpoll']
         minpoll = data['minpoll']
         force = data.pop('force', False)
-        usable = True if await self.middleware.run_in_io_thread(
+        usable = True if await self.middleware.run_in_thread(
             self.test_ntp_server, data['address']) else False
 
         if not force and not usable:

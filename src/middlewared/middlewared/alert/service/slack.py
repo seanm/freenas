@@ -1,7 +1,7 @@
 import json
 import requests
 
-from middlewared.alert.base import ThreadedAlertService, format_alerts
+from middlewared.alert.base import ThreadedAlertService
 from middlewared.schema import Dict, Str
 
 
@@ -10,12 +10,8 @@ class SlackAlertService(ThreadedAlertService):
 
     schema = Dict(
         "slack_attributes",
-        Str("cluster_name"),
-        Str("url"),
-        Str("channel"),
-        Str("username"),
-        Str("icon_url"),
-        Str("detailed"),
+        Str("url", required=True, empty=False),
+        strict=True,
     )
 
     def send_sync(self, alerts, gone_alerts, new_alerts):
@@ -23,10 +19,7 @@ class SlackAlertService(ThreadedAlertService):
             self.attributes["url"],
             headers={"Content-type": "application/json"},
             data=json.dumps({
-                "channel": self.attributes["channel"],
-                "username": self.attributes["username"],
-                "icon_url": self.attributes["icon_url"],
-                "text": format_alerts(alerts, gone_alerts, new_alerts),
+                "text": self._format_alerts(alerts, gone_alerts, new_alerts),
             }),
             timeout=15,
         )

@@ -1,13 +1,19 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3
 # License: BSD
 
 import os
 import pytest
 import sys
-
+from time import sleep
 apifolder = os.getcwd()
 sys.path.append(apifolder)
 from functions import DELETE, POST, PUT, GET
+from auto_config import interface
+
+Reason = f"VM detected no real ATA disk"
+
+interface_exist = (interface == "vtnet0" or interface == "em0")
+not_real_disk = pytest.mark.skipif(interface_exist, reason=Reason)
 
 
 @pytest.fixture(scope='module')
@@ -72,11 +78,15 @@ def test_06_look_smartd_service_at_boot():
     assert results.json()[0]["enable"] is True, results.text
 
 
+@not_real_disk
 def test_07_starting_smartd_service():
-    results = POST("/service/start/", {"service": "smartd", "service-control": {"onetime": True}})
+    payload = {"service": "smartd", "service-control": {"onetime": True}}
+    results = POST("/service/start/", payload)
     assert results.status_code == 200, results.text
+    sleep(1)
 
 
+@not_real_disk
 def test_08_checking_to_see_if_smartd_service_is_running():
     results = GET('/service/?service=smartd')
     assert results.json()[0]["state"] == "RUNNING", results.text

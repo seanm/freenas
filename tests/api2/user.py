@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3
 
 # Author: Eric Turgeon
 # License: BSD
@@ -12,7 +12,7 @@ from functions import POST, GET, DELETE, PUT
 
 
 def test_01_get_next_uid():
-    results = GET('/user/get_next_uid')
+    results = GET('/user/get_next_uid/')
     assert results.status_code == 200, results.text
     global next_uid
     next_uid = results.json()
@@ -25,7 +25,7 @@ def test_02_creating_user_testuser():
                "password": "test",
                "uid": next_uid,
                "shell": "/bin/csh"}
-    results = POST("/user", payload)
+    results = POST("/user/", payload)
     assert results.status_code == 200, results.text
 
 
@@ -56,14 +56,14 @@ def test_08_look_user_shell():
 
 def test_09_add_employe_id_and_team_special_atributes():
     userid = GET('/user?username=testuser').json()[0]['id']
-    payload = {'Employe ID': 'TU1234',
-               'Team': 'QA'}
+    payload = {'key': 'Employe ID', 'value': 'TU1234',
+               'key': 'Team', 'value': 'QA'}
     results = POST("/user/id/%s/set_attribute" % userid, payload)
     assert results.status_code == 200, results.text
 
 
 def test_10_get_new_next_uid():
-    results = GET('/user/get_next_uid')
+    results = GET('/user/get_next_uid/')
     assert results.status_code == 200, results.text
     global new_next_uid
     new_next_uid = results.json()
@@ -112,23 +112,47 @@ def test_17_look_user_groups():
 def test_18_remove_old_team_special_atribute():
     userid = GET('/user?username=testuser').json()[0]['id']
     payload = 'Team'
-    results = POST("/user/id/%s/pop_attribute" % userid, payload)
+    results = POST("/user/id/%s/pop_attribute/" % userid, payload)
     assert results.status_code == 200, results.text
 
 
 def test_19_add_new_team_to_special_atribute():
     userid = GET('/user?username=testuser').json()[0]['id']
-    payload = {'Team': 'QC'}
-    results = POST("/user/id/%s/set_attribute" % userid, payload)
+    payload = {'key': 'Team', 'value': 'QA'}
+    results = POST("/user/id/%s/set_attribute/" % userid, payload)
     assert results.status_code == 200, results.text
 
 
 # Delete the testuser
 def test_20_deleting_user_testuser():
     userid = GET('/user?username=testuser').json()[0]['id']
-    results = DELETE("/user/id/%s" % userid, {"delete_group": True})
+    results = DELETE("/user/id/%s/" % userid, {"delete_group": True})
     assert results.status_code == 200, results.text
 
 
 def test_21_look_user_is_delete():
     assert len(GET('/user?username=testuser').json()) == 0
+
+
+def test_22_has_root_password():
+    assert GET('/user/has_root_password/', anonymous=True).json() is True
+
+
+def test_23_get_next_uid_for_shareuser():
+    results = GET('/user/get_next_uid/')
+    assert results.status_code == 200, results.text
+    global next_uid
+    next_uid = results.json()
+
+
+def test_24_creating_shareuser_to_test_sharing():
+    payload = {
+        "username": "shareuser",
+        "full_name": "Share User",
+        "group_create": True,
+        "groups": [1],
+        "password": "testing",
+        "uid": next_uid,
+        "shell": "/bin/csh"}
+    results = POST("/user/", payload)
+    assert results.status_code == 200, results.text

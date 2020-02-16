@@ -7,18 +7,20 @@ set -x
 # because of use case sys.path.append('..'); import <module>
 
 tmpafter=$(mktemp)
-find gui src -name \*.py -exec flake8 --ignore=E402,E501 {} + | egrep -v "migrations/|usr/local/share/pysnmp/mibs/" > $tmpafter
+find src -name \*.py -exec flake8 --ignore=E402,E501,W504 {} + | egrep -v "alembic/versions/|usr/local/share/pysnmp/mibs/" > $tmpafter
 num_errors_after=`cat $tmpafter | wc -l`
 echo $num_errors_after
 
 if [ "${TRAVIS_PULL_REQUEST}" = "false" ]; then
 git checkout HEAD~
 else
+git remote set-branches origin ${TRAVIS_BRANCH}
+git fetch --depth 1 origin ${TRAVIS_BRANCH}
 git checkout ${TRAVIS_BRANCH}
 fi
 
 tmpbefore=$(mktemp)
-find gui src -name \*.py -exec flake8 --ignore=E402,E501 {} + | egrep -v "migrations/|usr/local/share/pysnmp/mibs/" > $tmpbefore
+find src -name \*.py -exec flake8 --ignore=E402,E501,W504 {} + | egrep -v "alembic/versions/|usr/local/share/pysnmp/mibs/" > $tmpbefore
 num_errors_before=`cat $tmpbefore | wc -l`
 echo $num_errors_before
 

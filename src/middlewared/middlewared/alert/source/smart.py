@@ -1,29 +1,29 @@
-from datetime import timedelta
-
-from freenasUI.services.utils import SmartAlert
-
-from middlewared.alert.base import Alert, AlertLevel, ThreadedAlertSource
-from middlewared.alert.schedule import IntervalSchedule
+from middlewared.alert.base import AlertClass, OneShotAlertClass, AlertCategory, AlertLevel, Alert
 
 
-class SMARTAlertSource(ThreadedAlertSource):
+class SMARTAlertClass(AlertClass, OneShotAlertClass):
+    category = AlertCategory.HARDWARE
     level = AlertLevel.CRITICAL
-    title = "SMART error"
+    title = "S.M.A.R.T. Error"
+    text = "%(message)s."
 
     hardware = True
 
-    schedule = IntervalSchedule(timedelta(minutes=5))
+    deleted_automatically = False
 
-    def check_sync(self):
-        alerts = []
+    async def create(self, args):
+        if not args["device"].startswith("/dev/"):
+            args["device"] = f"/dev/{args['device']}"
 
-        with SmartAlert() as sa:
-            for msgs in sa.data.values():
-                if not msgs:
-                    continue
-                for msg in msgs:
-                    if msg is None:
-                        continue
-                    alerts.append(Alert(msg))
+        return Alert(SMARTAlertClass, args)
 
-        return alerts
+    async def delete(self, alerts, query):
+        device = query
+
+        if not device.startswith("/dev/"):
+            device = f"/dev/{device}"
+
+        return list(filter(
+            lambda alert: alert.args["device"] != device,
+            alerts
+        ))
