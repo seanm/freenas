@@ -12,7 +12,6 @@ from middlewared.validators import Range
 import csv
 import io
 import os
-import platform
 import psutil
 import re
 import requests
@@ -32,7 +31,7 @@ import warnings
 
 from licenselib.license import ContractType, Features, License
 
-IS_LINUX = platform.system().lower() == 'linux'
+
 SYSTEM_BOOT_ID = None
 # Flag telling whether the system completed boot and is ready to use
 SYSTEM_READY = False
@@ -43,6 +42,7 @@ CACHE_POOLS_STATUSES = 'system.system_health_pools'
 FIRST_INSTALL_SENTINEL = '/data/first-boot'
 LICENSE_FILE = '/data/license'
 
+RE_LINUX_DMESG_TTY = re.compile(r'ttyS\d+ at I/O (\S+)', flags=re.M)
 RE_MEMWIDTH = re.compile(r'Total Width:\s*(\d*)')
 
 
@@ -89,13 +89,21 @@ class SystemAdvancedService(ConfigService):
         """
         Get available choices for `serialport`.
         """
-        if await self.middleware.call('failover.hardware') == 'ECHOSTREAM':
+        if osc.IS_FREEBSD and await self.middleware.call('failover.hardware') == 'ECHOSTREAM':
             ports = {'0x3f8': '0x3f8'}
         else:
-            pipe = await Popen("/usr/sbin/devinfo -u | grep -A 99999 '^I/O ports:' | "
-                               "sed -En 's/ *([0-9a-fA-Fx]+).*\(uart[0-9]+\)/\\1/p'", stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, shell=True)
-            ports = {y: y for y in (await pipe.communicate())[0].decode().strip().strip('\n').split('\n') if y}
+            if osc.IS_LINUX:
+                proc = await Popen(
+                    'dmesg | grep ttyS',
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True,
+                )
+                output = (await proc.communicate())[0].decode()
+                ports = {i: i for i in RE_LINUX_DMESG_TTY.findall(output)}
+            else:
+                pipe = await Popen("/usr/sbin/devinfo -u | grep -A 99999 '^I/O ports:' | "
+                                   "sed -En 's/ *([0-9a-fA-Fx]+).*\(uart[0-9]+\)/\\1/p'", stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, shell=True)
+                ports = {y: y for y in (await pipe.communicate())[0].decode().strip().strip('\n').split('\n') if y}
 
         if not ports or (await self.config())['serialport'] == '0x2f8':
             # We should always add 0x2f8 if ports is false or current value is the default one in db
@@ -135,7 +143,10 @@ class SystemAdvancedService(ConfigService):
             else:
                 data['serialport'] = serial_choice = hex(
                     int(serial_choice)
-                ) if serial_choice.isdigit() else serial_choice
+                ) if serial_choice.isdigit() else hex(int(serial_choice, 16))
+                # The else can happen when we have incoming value like 0x03f8 which is a valid
+                # hex value but the following validation would fail as we are not comparing with
+                # normalised hex strings
                 if serial_choice not in await self.serial_port_choices():
                     verrors.add(
                         f'{schema}.serialport',
@@ -241,30 +252,32 @@ class SystemAdvancedService(ConfigService):
 
             loader_reloaded = False
             if original_data['motd'] != config_data['motd']:
-                await self.middleware.call('service.start', 'motd', {'onetime': False})
+                await self.middleware.call('service.start', 'motd')
 
             if original_data['consolemenu'] != config_data['consolemenu']:
-                await self.middleware.call('service.start', 'ttys', {'onetime': False})
+                await self.middleware.call('service.start', 'ttys')
 
             if original_data['powerdaemon'] != config_data['powerdaemon']:
-                await self.middleware.call('service.restart', 'powerd', {'onetime': False})
+                await self.middleware.call('service.restart', 'powerd')
 
             if original_data['serialconsole'] != config_data['serialconsole']:
-                await self.middleware.call('service.start', 'ttys', {'onetime': False})
+                await self.middleware.call('service.start', 'ttys')
                 if not loader_reloaded:
-                    await self.middleware.call('service.reload', 'loader', {'onetime': False})
+                    await self.middleware.call('service.reload', 'loader')
                     loader_reloaded = True
+                if osc.IS_LINUX:
+                    await self.middleware.call('etc.generate', 'grub')
             elif (
                 original_data['serialspeed'] != config_data['serialspeed'] or
                 original_data['serialport'] != config_data['serialport']
             ):
                 if not loader_reloaded:
-                    await self.middleware.call('service.reload', 'loader', {'onetime': False})
+                    await self.middleware.call('service.reload', 'loader')
                     loader_reloaded = True
 
             if original_data['autotune'] != config_data['autotune']:
                 if not loader_reloaded:
-                    await self.middleware.call('service.reload', 'loader', {'onetime': False})
+                    await self.middleware.call('service.reload', 'loader')
                     loader_reloaded = True
                 await self.middleware.call('system.advanced.autotune', 'loader')
                 await self.middleware.call('system.advanced.autotune', 'sysctl')
@@ -273,10 +286,10 @@ class SystemAdvancedService(ConfigService):
                 original_data['debugkernel'] != config_data['debugkernel'] and
                 not loader_reloaded
             ):
-                await self.middleware.call('service.reload', 'loader', {'onetime': False})
+                await self.middleware.call('service.reload', 'loader')
 
             if original_data['fqdn_syslog'] != config_data['fqdn_syslog']:
-                await self.middleware.call('service.restart', 'syslogd', {'onetime': False})
+                await self.middleware.call('service.restart', 'syslogd')
 
             if (
                 original_data['sysloglevel'].lower() != config_data['sysloglevel'].lower() or
@@ -620,12 +633,12 @@ class SystemService(Service):
 
         cp = subprocess.Popen(
             ['ixdiagnose', '-d', direc, '-s', '-F', '-p'],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             bufsize=1
         )
 
-        for line in iter(cp.stdout.readline, ''):
-            line = line.rstrip()
+        for line in iter(cp.stdout.readline, b''):
+            line = line.decode(errors='ignore').rstrip()
 
             if line.startswith('**'):
                 percent, help = line.split(':')
@@ -1296,7 +1309,7 @@ class SystemGeneralService(ConfigService):
             'sort | uniq'.format(
                 # Linux sockstat uses -R for protocol selection
                 # FreeBSD uses -P instead.
-                *(('R', '6', '4', '5') if IS_LINUX else ('P', '7', '5', '6'))
+                *(('R', '6', '4', '5') if osc.IS_LINUX else ('P', '7', '5', '6'))
             ),
             shell=True, capture_output=True, text=True,
         )
@@ -1492,8 +1505,7 @@ async def setup(middleware):
     settings = await middleware.call(
         'system.general.config',
     )
-    os.environ['TZ'] = settings['timezone']
-    time.tzset()
+    await middleware.call('core.environ_update', {'TZ': settings['timezone']})
 
     middleware.logger.debug(f'Timezone set to {settings["timezone"]}')
 
@@ -1524,7 +1536,7 @@ async def setup(middleware):
         'sysctl debug.ddb.textdump.pending=1',
         'sysctl debug.debugger_on_panic=1',
         'sysctl debug.ddb.capture.bufsize=4194304'
-    ] if not IS_LINUX else []:  # TODO: See reasonable linux alternative
+    ] if osc.IS_FREEBSD else []:  # TODO: See reasonable linux alternative
         ret = await Popen(
             command,
             shell=True,

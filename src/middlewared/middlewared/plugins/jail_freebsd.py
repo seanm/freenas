@@ -715,9 +715,10 @@ class JailService(CRUDService):
         Retrieve default configuration for iocage jails.
         """
         if not self.iocage_set_up():
-            return IOCJson.retrieve_default_props()
+            defaults = IOCJson.retrieve_default_props()
         else:
-            return self.query(filters=[['host_hostuuid', '=', 'default']], options={'get': True})
+            defaults = self.query(filters=[['host_hostuuid', '=', 'default']], options={'get': True})
+        return {k: v for k, v in defaults.items() if k not in IOCJson.default_only_props}
 
     @accepts(
         Bool('remote', default=False),
@@ -1252,6 +1253,10 @@ class JailService(CRUDService):
         ))
     def fstab(self, jail, options):
         """Manipulate a jails fstab"""
+        jail_data = self.middleware.call_sync('jail.get_instance', jail)
+        if jail_data['template'] and options['action'] != 'LIST':
+            raise CallError(f'Unable to perform {options["action"]} action as {jail} is a template.')
+
         uuid, _, iocage = self.check_jail_existence(jail, skip=False)
         status, jid = IOCList.list_get_jid(uuid)
         action = options['action'].lower()
@@ -1433,6 +1438,9 @@ class JailService(CRUDService):
 
         def progress_callback(content, exception):
             msg = content['message'].strip('\n')
+            if 'No updates needed to update system' in msg:
+                raise CallError(f'No updates available for {jail}')
+
             if content['level'] == 'EXCEPTION':
                 raise exception(msg)
 

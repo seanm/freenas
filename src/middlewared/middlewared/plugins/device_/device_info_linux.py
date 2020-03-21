@@ -58,7 +58,7 @@ class DeviceService(Service, DeviceInfoBase):
         lshw_disks = self.retrieve_lshw_disks_data()
 
         for block_device in blkid.list_block_devices():
-            if block_device.name.startswith(('sr', 'md', 'dm-', 'loop')):
+            if block_device.name.startswith(('sr', 'md', 'dm-', 'loop', 'zd')):
                 continue
             device_type = os.path.join('/sys/block', block_device.name, 'device/type')
             if os.path.exists(device_type):
@@ -67,7 +67,10 @@ class DeviceService(Service, DeviceInfoBase):
                         continue
             # nvme drives won't have this
 
-            disks[block_device.name] = self.get_disk_details(block_device, self.disk_default.copy(), lshw_disks)
+            try:
+                disks[block_device.name] = self.get_disk_details(block_device, self.disk_default.copy(), lshw_disks)
+            except Exception as e:
+                self.middleware.logger.debug('Failed to retrieve disk details for %s : %s', block_device.name, str(e))
         return disks
 
     @private

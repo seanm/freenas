@@ -1,5 +1,4 @@
 import errno
-import platform
 import subprocess
 import threading
 import time
@@ -12,10 +11,8 @@ from middlewared.schema import Any, Dict, Int, List, Str, Bool, accepts
 from middlewared.service import (
     CallError, CRUDService, ValidationError, ValidationErrors, filterable, job,
 )
-from middlewared.utils import filter_list, filter_getattrs
+from middlewared.utils import filter_list, filter_getattrs, osc
 from middlewared.validators import ReplicationSnapshotNamingSchema
-
-IS_LINUX = platform.system().lower() == 'linux'
 
 
 class ZFSSetPropertyError(CallError):
@@ -99,7 +96,7 @@ class ZFSPoolService(CRUDService):
             List('vdevs', items=[
                 Dict(
                     'vdev',
-                    Str('root', enum=['DATA', 'CACHE', 'LOG', 'SPARE'], required=True),
+                    Str('root', enum=['DATA', 'CACHE', 'LOG', 'SPARE', 'SPECIAL', 'DEDUP'], required=True),
                     Str('type', enum=['RAIDZ1', 'RAIDZ2', 'RAIDZ3', 'MIRROR', 'STRIPE'], required=True),
                     List('devices', items=[Str('disk')], required=True),
                 ),
@@ -355,7 +352,7 @@ class ZFSPoolService(CRUDService):
         found = False
         with libzfs.ZFS() as zfs:
             for pool in zfs.find_import(
-                cachefile=cachefile, search_paths=['/dev/disk/by-partuuid'] if IS_LINUX else None
+                cachefile=cachefile, search_paths=['/dev/disk/by-partuuid'] if osc.IS_LINUX else None
             ):
                 if pool.name == name_or_guid or str(pool.guid) == name_or_guid:
                     found = pool
@@ -364,7 +361,16 @@ class ZFSPoolService(CRUDService):
             if not found:
                 raise CallError(f'Pool {name_or_guid} not found.', errno.ENOENT)
 
-            zfs.import_pool(found, new_name or found.name, options, any_host=any_host)
+            try:
+                zfs.import_pool(found, new_name or found.name, options, any_host=any_host)
+            except libzfs.ZFSException as e:
+                # We only log if some datasets failed to mount after pool import
+                if e.code != libzfs.Error.MOUNTFAILED:
+                    raise
+                else:
+                    self.logger.error(
+                        'Failed to mount datasets after importing "%s" pool: %s', name_or_guid, str(e), exc_info=True
+                    )
 
     @accepts(Str('pool'))
     async def find_not_online(self, pool):
@@ -543,7 +549,7 @@ class ZFSDatasetService(CRUDService):
                 entry['obj_used_percent'] = entry['obj_used'] / entry['obj_quota'] * 100
 
             try:
-                if quota_type == 'USER':
+                if entry['quota_type'] == 'USER':
                     entry['name'] = (
                         self.middleware.call_sync('user.get_user_obj',
                                                   {'uid': entry['id']})
@@ -807,6 +813,9 @@ class ZFSDatasetService(CRUDService):
         if recursive:
             args += ['-r']
 
+        # If dataset is mounted and has receive_resume_token, we should destroy it or ZFS will say
+        # "cannot destroy 'pool/dataset': dataset already exists"
+        recv_run = subprocess.run(['zfs', 'recv', '-A', id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Destroying may take a long time, lets not use py-libzfs as it will block
         # other ZFS operations.
         try:
@@ -814,6 +823,9 @@ class ZFSDatasetService(CRUDService):
                 ['zfs', 'destroy'] + args + [id], text=True, capture_output=True, check=True,
             )
         except subprocess.CalledProcessError as e:
+            if recv_run.returncode == 0 and e.stderr.strip().endswith('dataset does not exist'):
+                # This operation might have deleted this dataset if it was created by `zfs recv` operation
+                return
             self.logger.error('Failed to delete dataset', exc_info=True)
             error = e.stderr.strip()
             errno_ = errno.EFAULT

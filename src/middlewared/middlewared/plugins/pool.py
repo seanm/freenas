@@ -6,7 +6,6 @@ import json
 import logging
 from datetime import datetime, time, timedelta
 import os
-import platform
 import psutil
 import re
 import secrets
@@ -26,21 +25,24 @@ from middlewared.service import (
 )
 from middlewared.service_exception import ValidationError
 import middlewared.sqlalchemy as sa
-from middlewared.utils import Popen, filter_list, run, start_daemon_thread
+from middlewared.utils import osc, Popen, filter_list, run, start_daemon_thread
 from middlewared.utils.asyncio_ import asyncio_map
 from middlewared.utils.shell import join_commandline
-from middlewared.validators import Match, Range, Time
+from middlewared.validators import Exact, Match, Or, Range, Time
 
 logger = logging.getLogger(__name__)
 
 GELI_KEYPATH = '/data/geli'
-IS_LINUX = platform.system().lower() == 'linux'
+
 RE_HISTORY_ZPOOL_SCRUB = re.compile(r'^([0-9\.\:\-]{19})\s+zpool scrub', re.MULTILINE)
 RE_HISTORY_ZPOOL_CREATE = re.compile(r'^([0-9\.\:\-]{19})\s+zpool create', re.MULTILINE)
+ZFS_ENCRYPTION_ALGORITHM_CHOICES = [
+    'AES-128-CCM', 'AES-192-CCM', 'AES-256-CCM', 'AES-128-GCM', 'AES-192-GCM', 'AES-256-GCM'
+]
 ZPOOL_CACHE_FILE = '/data/zfs/zpool.cache'
 ZPOOL_KILLCACHE = '/data/zfs/killcache'
 
-if not IS_LINUX:
+if osc.IS_FREEBSD:
     import sysctl
 
 
@@ -396,7 +398,7 @@ class PoolService(CRUDService):
             if path is not None:
                 device = disk = None
                 if path.startswith('/dev/'):
-                    args = [path[5:]] + ([] if IS_LINUX else [options.get('geom_scan', True)])
+                    args = [path[5:]] + ([] if osc.IS_LINUX else [options.get('geom_scan', True)])
                     device = self.middleware.call_sync('disk.label_to_dev', *args)
                     disk = self.middleware.call_sync('disk.label_to_disk', *args)
                 x['device'] = device
@@ -441,7 +443,7 @@ class PoolService(CRUDService):
                 'status_detail': None,
             })
 
-        if not IS_LINUX and pool['encrypt'] > 0:
+        if osc.IS_FREEBSD and pool['encrypt'] > 0:
             if zpool:
                 pool['is_decrypted'] = True
             else:
@@ -468,11 +470,7 @@ class PoolService(CRUDService):
             'encryption_options',
             Bool('generate_key', default=False),
             Int('pbkdf2iters', default=350000, validators=[Range(min=100000)]),
-            Str(
-                'algorithm', default='AES-256-CCM', enum=[
-                    'AES-128-CCM', 'AES-192-CCM', 'AES-256-CCM', 'AES-128-GCM', 'AES-192-GCM', 'AES-256-GCM'
-                ]
-            ),
+            Str('algorithm', default='AES-256-CCM', enum=ZFS_ENCRYPTION_ALGORITHM_CHOICES),
             Str('passphrase', default=None, null=True, empty=False, private=True),
             Str('key', default=None, null=True, validators=[Range(min=64, max=64)], private=True),
             register=True
@@ -486,6 +484,20 @@ class PoolService(CRUDService):
                     List('disks', items=[Str('disk')], required=True),
                 ),
             ], required=True),
+            List('special', items=[
+                Dict(
+                    'specialvdevs',
+                    Str('type', enum=['MIRROR', 'STRIPE'], required=True),
+                    List('disks', items=[Str('disk')], required=True),
+                ),
+            ]),
+            List('dedup', items=[
+                Dict(
+                    'dedupvdevs',
+                    Str('type', enum=['MIRROR', 'STRIPE'], required=True),
+                    List('disks', items=[Str('disk')], required=True),
+                ),
+            ]),
             List('cache', items=[
                 Dict(
                     'cachevdevs',
@@ -603,6 +615,7 @@ class PoolService(CRUDService):
             'cachefile': ZPOOL_CACHE_FILE,
             'failmode': 'continue',
             'autoexpand': 'on',
+            'ashift': 12,
         }
 
         fsoptions = {
@@ -623,6 +636,7 @@ class PoolService(CRUDService):
         pool_id = z_pool = encrypted_dataset_pk = None
         try:
             job.set_progress(90, 'Creating ZFS Pool')
+
             z_pool = await self.middleware.call('zfs.pool.create', {
                 'name': data['name'],
                 'vdevs': vdevs,
@@ -659,7 +673,7 @@ class PoolService(CRUDService):
                 }
             )
 
-            if not IS_LINUX:
+            if osc.IS_FREEBSD:
                 await self.middleware.call('pool.save_encrypteddisks', pool_id, formatted_disks, disks_cache)
 
             await self.middleware.call(
@@ -670,6 +684,10 @@ class PoolService(CRUDService):
             )
         except Exception as e:
             # Something wrong happened, we need to rollback and destroy pool.
+            if osc.IS_LINUX:
+                self.middleware.logger.debug(
+                    'Pool %s failed to create with topology %s', data['name'], data['topology'],
+                )
             if z_pool:
                 try:
                     await self.middleware.call('zfs.pool.delete', data['name'])
@@ -694,6 +712,7 @@ class PoolService(CRUDService):
             # regenerate crontab because of scrub
             await self.middleware.call('service.restart', 'cron')
 
+        await self.middleware.call('disk.swaps_configure')
         asyncio.ensure_future(restart_services())
 
         pool = await self.get_instance(pool_id)
@@ -704,6 +723,7 @@ class PoolService(CRUDService):
         'pool_create', 'pool_update',
         ('rm', {'name': 'name'}),
         ('rm', {'name': 'encryption'}),
+        ('rm', {'name': 'deduplication'}),
         ('edit', {'name': 'topology', 'method': lambda x: setattr(x, 'update', True)}),
     ))
     @job(lock='pool_createupdate')
@@ -742,7 +762,7 @@ class PoolService(CRUDService):
         if verrors:
             raise verrors
 
-        if not IS_LINUX and pool['encryptkey']:
+        if osc.IS_FREEBSD and pool['encryptkey']:
             enc_keypath = os.path.join(GELI_KEYPATH, f'{pool["encryptkey"]}.key')
         else:
             enc_keypath = None
@@ -757,7 +777,7 @@ class PoolService(CRUDService):
         if extend_job.error:
             raise CallError(extend_job.error)
 
-        if not IS_LINUX:
+        if osc.IS_FREEBSD:
             await self.middleware.call('pool.save_encrypteddisks', id, enc_disks, disks_cache)
 
             if pool['encrypt'] >= 2:
@@ -772,58 +792,59 @@ class PoolService(CRUDService):
         return pool
 
     async def __common_validation(self, verrors, data, schema_name, old=None):
-        topology_data = list(data['topology'].get('data') or [])
 
-        if old:
-            def disk_to_stripe():
-                """
-                We need to convert the original topology to use STRIPE
-                instead of DISK to match the user input data
-                """
-                rv = []
-                spare = None
-                for i in old['topology']['data']:
-                    if i['type'] == 'DISK':
-                        if spare is None:
-                            spare = {
-                                'type': 'STRIPE',
-                                'disks': [i['path']],
-                            }
-                            rv.append(spare)
-                        else:
-                            spare['disks'].append(i['path'])
+        def disk_to_stripe(topology_type):
+            """
+            We need to convert the original topology to use STRIPE
+            instead of DISK to match the user input data
+            """
+            rv = []
+            spare = None
+            for i in old['topology'][topology_type]:
+                if i['type'] == 'DISK':
+                    if spare is None:
+                        spare = {
+                            'type': 'STRIPE',
+                            'disks': [i['path']],
+                        }
+                        rv.append(spare)
                     else:
-                        rv.append({
-                            'type': i['type'],
-                            'disks': [j['type'] for j in i['children']],
-                        })
-                return rv
+                        spare['disks'].append(i['path'])
+                else:
+                    rv.append({
+                        'type': i['type'],
+                        'disks': [j['type'] for j in i['children']],
+                    })
+            return rv
 
-            topology_data += disk_to_stripe()
-        lastdatatype = None
-        for i, vdev in enumerate(topology_data):
-            numdisks = len(vdev['disks'])
-            minmap = {
-                'STRIPE': 1,
-                'MIRROR': 2,
-                'RAIDZ1': 3,
-                'RAIDZ2': 4,
-                'RAIDZ3': 5,
-            }
-            mindisks = minmap[vdev['type']]
-            if numdisks < mindisks:
-                verrors.add(
-                    f'{schema_name}.topology.data.{i}.disks',
-                    f'You need at least {mindisks} disk(s) for this vdev type.',
-                )
+        for topology_type in ('data', 'special', 'dedup'):
+            lastdatatype = None
+            topology_data = list(data['topology'].get(topology_type) or [])
+            if old:
+                topology_data += disk_to_stripe(topology_type)
+            for i, vdev in enumerate(topology_data):
+                numdisks = len(vdev['disks'])
+                minmap = {
+                    'STRIPE': 1,
+                    'MIRROR': 2,
+                    'RAIDZ1': 3,
+                    'RAIDZ2': 4,
+                    'RAIDZ3': 5,
+                }
+                mindisks = minmap[vdev['type']]
+                if numdisks < mindisks:
+                    verrors.add(
+                        f'{schema_name}.topology.{topology_type}.{i}.disks',
+                        f'You need at least {mindisks} disk(s) for this vdev type.',
+                    )
 
-            if lastdatatype and lastdatatype != vdev['type']:
-                verrors.add(
-                    f'{schema_name}.topology.data.{i}.type',
-                    'You are not allowed to create a pool with different data vdev types '
-                    f'({lastdatatype} and {vdev["type"]}).',
-                )
-            lastdatatype = vdev['type']
+                if lastdatatype and lastdatatype != vdev['type']:
+                    verrors.add(
+                        f'{schema_name}.topology.{topology_type}.{i}.type',
+                        f'You are not allowed to create a pool with different {topology_type} vdev types '
+                        f'({lastdatatype} and {vdev["type"]}).',
+                    )
+                lastdatatype = vdev['type']
 
         for i in ('cache', 'log', 'spare'):
             value = data['topology'].get(i)
@@ -842,7 +863,7 @@ class PoolService(CRUDService):
         # to be performed in parallel if we wish to do so.
         disks = {}
         vdevs = []
-        for i in ('data', 'cache', 'log'):
+        for i in ('data', 'cache', 'log', 'special', 'dedup'):
             t_vdevs = topology.get(i)
             if not t_vdevs:
                 continue
@@ -885,7 +906,7 @@ class PoolService(CRUDService):
             if pool['is_decrypted'] and pool['status'] != 'OFFLINE':
                 for i in await self.middleware.call('zfs.pool.get_disks', pool['name']):
                     yield i
-            elif not IS_LINUX:
+            elif osc.IS_FREEBSD:
                 for encrypted_disk in await self.middleware.call(
                     'datastore.query',
                     'storage.encrypteddisk',
@@ -952,7 +973,7 @@ class PoolService(CRUDService):
 
         await self.middleware.call('zfs.pool.detach', pool['name'], found[1]['guid'])
 
-        if not IS_LINUX:
+        if osc.IS_FREEBSD:
             await self.middleware.call('pool.sync_encrypted', oid)
 
         if disk:
@@ -1004,7 +1025,7 @@ class PoolService(CRUDService):
 
         await self.middleware.call('zfs.pool.offline', pool['name'], found[1]['guid'])
 
-        if not IS_LINUX and found[1]['path'].endswith('.eli'):
+        if osc.IS_FREEBSD and found[1]['path'].endswith('.eli'):
             devname = found[1]['path'].replace('/dev/', '')[:-4]
             await self.middleware.call('disk.geli_detach_single', devname)
             await self.middleware.call(
@@ -1046,7 +1067,7 @@ class PoolService(CRUDService):
         if not found:
             verrors.add('options.label', f'Label {options["label"]} not found on this pool.')
 
-        if not IS_LINUX and pool['encrypt'] > 0:
+        if osc.IS_FREEBSD and pool['encrypt'] > 0:
             verrors.add('id', 'Disk cannot be set to online in encrypted pool.')
 
         if verrors:
@@ -1106,7 +1127,7 @@ class PoolService(CRUDService):
 
         await self.middleware.call('zfs.pool.remove', pool['name'], found[1]['guid'])
 
-        if not IS_LINUX:
+        if osc.IS_FREEBSD:
             await self.middleware.call('pool.sync_encrypted', oid)
 
             if found[1]['path'].endswith('.eli'):
@@ -1160,7 +1181,7 @@ class PoolService(CRUDService):
             resilver_min_time_ms = 3000
             scan_idle = 50
 
-        if IS_LINUX:
+        if osc.IS_LINUX:
             with open('/sys/module/zfs/parameters/zfs_resilver_min_time_ms', 'w') as f:
                 f.write(str(resilver_min_time_ms))
         else:
@@ -1172,7 +1193,8 @@ class PoolService(CRUDService):
     @job()
     async def import_find(self, job):
         """
-        Get a list of pools available for import with the following details:
+        Returns a job id which can be used to retrieve a list of pools available for
+        import with the following details as a result of the job:
         name, guid, status, hostname.
         """
 
@@ -1258,7 +1280,7 @@ class PoolService(CRUDService):
             encrypt = 0
 
         activated_jail_pool = None
-        if not IS_LINUX:
+        if osc.IS_FREEBSD:
             with contextlib.suppress(Exception):
                 activated_jail_pool = await self.middleware.call('jail.get_activated_pool')
 
@@ -1301,7 +1323,7 @@ class PoolService(CRUDService):
                     f'Failed to inherit mountpoints recursively for imported {pool_name} pool: {e}'
                 )
 
-            if not IS_LINUX:
+            if osc.IS_FREEBSD:
                 await self.middleware.call('pool.sync_encrypted', pool_id)
         except Exception:
             if pool_id:
@@ -1418,7 +1440,7 @@ class PoolService(CRUDService):
                 pass
             else:
                 raise
-        if not IS_LINUX:
+        if osc.IS_FREEBSD:
             await self.middleware.call('iscsi.global.terminate_luns_for_pool', pool['name'])
 
         job.set_progress(30, 'Removing pool disks from swap')
@@ -1453,7 +1475,7 @@ class PoolService(CRUDService):
 
             await self.middleware.call('disk.sync_all')
 
-            if not IS_LINUX:
+            if osc.IS_FREEBSD:
                 await self.middleware.call('disk.geli_detach', pool, True)
             if pool['encrypt'] > 0:
                 try:
@@ -1468,7 +1490,7 @@ class PoolService(CRUDService):
         else:
             job.set_progress(80, 'Exporting pool')
             await self.middleware.call('zfs.pool.export', pool['name'])
-            if not IS_LINUX:
+            if osc.IS_FREEBSD:
                 await self.middleware.call('disk.geli_detach', pool)
 
         job.set_progress(90, 'Cleaning up')
@@ -1561,7 +1583,7 @@ class PoolService(CRUDService):
         job.set_progress(0, 'Beginning pools import')
 
         try:
-            if not IS_LINUX:
+            if osc.IS_FREEBSD:
                 proc = subprocess.Popen(
                     ['dtrace', '-qn', 'zfs-dbgmsg{printf("%s\\n", stringof(arg0))}'],
                     stdout=subprocess.PIPE,
@@ -1642,7 +1664,7 @@ class PoolService(CRUDService):
                         self.middleware.call_sync('zfs.dataset.umount', pool['name'], {'force': True})
 
         finally:
-            if not IS_LINUX:
+            if osc.IS_FREEBSD:
                 proc.kill()
                 proc.wait()
 
@@ -1673,9 +1695,9 @@ class PoolService(CRUDService):
 
         # Configure swaps after importing pools. devd events are not yet ready at this
         # stage of the boot process.
-        if not IS_LINUX:
+        if osc.IS_FREEBSD:
             # For now let's make this FreeBSD specific as we may very well be getting zfs events here in linux
-            self.middleware.run_coroutine(self.middleware.call('disk.swaps_configure'), wait=False)
+            self.middleware.call_sync('disk.swaps_configure')
 
         job.set_progress(100, 'Pools import completed')
 
@@ -1805,6 +1827,13 @@ class PoolDatasetService(CRUDService):
 
     class Config:
         namespace = 'pool.dataset'
+
+    @accepts()
+    async def encryption_algorithm_choices(self):
+        """
+        Retrieve encryption algorithms supported for ZFS dataset encryption.
+        """
+        return {v: v for v in ZFS_ENCRYPTION_ALGORITHM_CHOICES}
 
     @private
     @accepts(
@@ -2193,21 +2222,54 @@ class PoolDatasetService(CRUDService):
 
         Keys/passphrase can be supplied to check if the keys are valid.
 
+        It should be noted that there are 2 keys which show if a recursive unlock operation is
+        done for `id`, which dataset will be unlocked and if not why it won't be unlocked. The keys
+        namely are "unlock_successful" and "unlock_error". The former is a boolean value showing if unlock
+        would succeed/fail. The latter is description why it failed if it failed.
+
+        If a dataset is already unlocked, it will show up as true for "unlock_successful" regardless of what
+        key user provided as the unlock keys in the output are to reflect what a real unlock operation would
+        behave. If user is interested in seeing if a provided key is valid or not, then the key to look out for
+        in the output is "valid_key" which based on what system has in database or if a user provided one, validates
+        the key and sets a boolean value for the dataset.
+
         Example output:
         [
             {
-                "name": "hex",
-                "key_format": "HEX",
-                "key_present": true,
+                "name": "vol",
+                "key_format": "PASSPHRASE",
+                "key_present_in_database": false,
                 "valid_key": true,
-                "locked": false
+                "locked": true,
+                "unlock_error": null,
+                "unlock_successful": true
             },
             {
-                "name": "hex/p",
+                "name": "vol/c1/d1",
                 "key_format": "PASSPHRASE",
-                "key_present": false,
+                "key_present_in_database": false,
                 "valid_key": false,
-                "locked": true
+                "locked": true,
+                "unlock_error": "Provided key is invalid",
+                "unlock_successful": false
+            },
+            {
+                "name": "vol/c",
+                "key_format": "PASSPHRASE",
+                "key_present_in_database": false,
+                "valid_key": false,
+                "locked": true,
+                "unlock_error": "Key not provided",
+                "unlock_successful": false
+            },
+            {
+                "name": "vol/c/d2",
+                "key_format": "PASSPHRASE",
+                "key_present_in_database": false,
+                "valid_key": false,
+                "locked": true,
+                "unlock_error": "Child cannot be unlocked when parent \"vol/c\" is locked and provided key is invalid",
+                "unlock_successful": false
             }
         ]
         """
@@ -2245,10 +2307,39 @@ class PoolDatasetService(CRUDService):
             ds_name = ds_data[0]
             data = datasets[ds_name]
             results.append({
-                'name': ds_name, 'key_format': ZFSKeyFormat(data['key_format']['value']).value,
+                'name': ds_name,
+                'key_format': ZFSKeyFormat(data['key_format']['value']).value,
                 'key_present_in_database': bool(data['encryption_key']),
-                'valid_key': bool(status['result']), 'locked': data['locked']
+                'valid_key': bool(status['result']), 'locked': data['locked'],
+                'unlock_error': None,
+                'unlock_successful': False,
             })
+
+        failed = set()
+        for ds in sorted(results, key=lambda d: d['name'].count('/')):
+            for i in range(1, ds['name'].count('/') + 1):
+                check = ds['name'].rsplit('/', i)[0]
+                if check in failed:
+                    failed.add(ds['name'])
+                    ds['unlock_error'] = f'Child cannot be unlocked when parent "{check}" is locked'
+
+            if ds['valid_key']:
+                ds['unlock_successful'] = not bool(ds['unlock_error'])
+            elif not ds['locked']:
+                # For datasets which are already not locked, unlock operation for them
+                # will succeed as they are not locked
+                ds['unlock_successful'] = True
+            else:
+                key_provided = ds['name'] in keys_supplied or ds['key_present_in_database']
+                if key_provided:
+                    if ds['unlock_error']:
+                        if ds['name'] in keys_supplied or ds['key_present_in_database']:
+                            ds['unlock_error'] += ' and provided key is invalid'
+                    else:
+                        ds['unlock_error'] = 'Provided key is invalid'
+                elif not ds['unlock_error']:
+                    ds['unlock_error'] = 'Key not provided'
+                failed.add(ds['name'])
 
         return results
 
@@ -2430,6 +2521,7 @@ class PoolDatasetService(CRUDService):
                 ('org.truenas:managedby', 'managedby', None),
                 ('dedup', 'deduplication', str.upper),
                 ('aclmode', None, str.upper),
+                ('xattr', None, str.upper),
                 ('atime', None, str.upper),
                 ('casesensitivity', None, str.upper),
                 ('exec', None, str.upper),
@@ -2452,6 +2544,7 @@ class PoolDatasetService(CRUDService):
                 ('encryption', 'encryption_algorithm', lambda o: o.upper() if o != 'off' else None),
                 ('used', None, None),
                 ('available', None, None),
+                ('special_small_blocks', 'special_small_block_size', None),
             ):
                 if orig_name not in dataset['properties']:
                     continue
@@ -2495,14 +2588,15 @@ class PoolDatasetService(CRUDService):
         Str('atime', enum=['ON', 'OFF']),
         Str('exec', enum=['ON', 'OFF']),
         Str('managedby', empty=False),
-        Int('quota', null=True),
+        Int('quota', null=True, validators=[Or(Range(min=1024**3), Exact(0))]),
         Int('quota_warning', validators=[Range(0, 100)]),
         Int('quota_critical', validators=[Range(0, 100)]),
-        Int('refquota', null=True),
+        Int('refquota', null=True, validators=[Or(Range(min=1024**3), Exact(0))]),
         Int('refquota_warning', validators=[Range(0, 100)]),
         Int('refquota_critical', validators=[Range(0, 100)]),
         Int('reservation'),
         Int('refreservation'),
+        Int('special_small_block_size', validators=[Range(min=512)]),
         Int('copies'),
         Str('snapdir', enum=['VISIBLE', 'HIDDEN']),
         Str('deduplication', enum=['ON', 'VERIFY', 'OFF']),
@@ -2513,6 +2607,7 @@ class PoolDatasetService(CRUDService):
         Str('casesensitivity', enum=['SENSITIVE', 'INSENSITIVE', 'MIXED']),
         Str('aclmode', enum=['PASSTHROUGH', 'RESTRICTED']),
         Str('share_type', default='GENERIC', enum=['GENERIC', 'SMB']),
+        Str('xattr', enum=['ON', 'SA']),
         Ref('encryption_options'),
         Bool('encryption', default=False),
         Bool('inherit_encryption', default=True),
@@ -2571,7 +2666,10 @@ class PoolDatasetService(CRUDService):
 
         if data['share_type'] == 'SMB':
             data['casesensitivity'] = 'INSENSITIVE'
-            data['aclmode'] = 'RESTRICTED'
+            # FIXME: aclmode not available in Linux (yet?)
+            if osc.IS_FREEBSD:
+                data['aclmode'] = 'RESTRICTED'
+            data['xattr'] = 'SA'
 
         if (await self.get_instance(data['name'].rsplit('/', 1)[0]))['locked']:
             verrors.add(
@@ -2655,6 +2753,8 @@ class PoolDatasetService(CRUDService):
             ('sync', None, str.lower),
             ('volblocksize', None, None),
             ('volsize', None, lambda x: str(x)),
+            ('xattr', None, str.lower),
+            ('special_small_block_size', 'special_small_blocks', None),
         ):
             if i not in data:
                 continue
@@ -2772,6 +2872,7 @@ class PoolDatasetService(CRUDService):
             ('readonly', None, str.lower, True),
             ('recordsize', None, None, True),
             ('volsize', None, lambda x: str(x), False),
+            ('special_small_block_size', 'special_small_blocks', None, True),
         )
 
         props = {}
@@ -2907,7 +3008,6 @@ class PoolDatasetService(CRUDService):
             'force': options['force'],
             'recursive': options['recursive'],
         })
-        await self.delete_encrypted_datasets_from_db([['name', '=', id]])
         return result
 
     @item_method
@@ -3403,15 +3503,22 @@ class PoolDatasetService(CRUDService):
         return result
 
     @private
-    async def kill_processes(self, oid, restart_services, max_tries=5):
-        manually_restart_services = []
+    async def kill_processes(self, oid, control_services, max_tries=5):
+        need_restart_services = []
+        need_stop_services = []
         for process in await self.middleware.call('pool.dataset.processes', oid):
-            if process.get("service") is not None:
-                manually_restart_services.append(process["service"])
-        if manually_restart_services and not restart_services:
-            raise CallError('Some services have open files and need to be restarted', errno.EBUSY, {
-                'code': 'services_restart',
-                'services': manually_restart_services,
+            service = process.get('service')
+            if service is not None:
+                if any(attachment_delegate.service == service for attachment_delegate in self.attachment_delegates):
+                    need_restart_services.append(service)
+                else:
+                    need_stop_services.append(service)
+        if (need_restart_services or need_stop_services) and not control_services:
+            raise CallError('Some services have open files and need to be restarted or stopped', errno.EBUSY, {
+                'code': 'control_services',
+                'restart_services': need_restart_services,
+                'stop_services': need_stop_services,
+                'services': need_restart_services + need_stop_services,
             })
 
         for i in range(max_tries):
@@ -3657,7 +3764,7 @@ class PoolScrubService(CRUDService):
 
             pool = await self.middleware.call('pool.query', [['name', '=', name]], {'get': True})
             if pool['status'] == 'OFFLINE':
-                if not IS_LINUX and not pool['is_decrypted']:
+                if osc.IS_FREEBSD and not pool['is_decrypted']:
                     raise ScrubError(f'Pool {name} is not decrypted, skipping scrub')
                 else:
                     raise ScrubError(f'Pool {name} is offline, not running scrub')

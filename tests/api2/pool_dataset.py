@@ -7,8 +7,8 @@ import os
 import pytest
 apifolder = os.getcwd()
 sys.path.append(apifolder)
-from functions import DELETE, GET, POST, PUT, wait_on_job
-from auto_config import pool_name
+from functions import DELETE, GET, POST, PUT, SSH_TEST, wait_on_job
+from auto_config import ip, pool_name, user, password
 
 dataset = f'{pool_name}/dataset1'
 dataset_url = dataset.replace('/', '%2F')
@@ -152,9 +152,9 @@ def test_13_strip_acl_from_dataset():
 def test_14_setting_dataset_quota():
     global results
     payload = [
-        {'quota_type': 'USER', 'id': 'root', 'quota_value': 10000},
-        {'quota_type': 'GROUP', 'id': '0', 'quota_value': 5000000},
-        {'quota_type': 'DATASET', 'id': 'QUOTA', 'quota_value': 700000000}
+        {'quota_type': 'USER', 'id': 'root', 'quota_value': 0},
+        {'quota_type': 'GROUP', 'id': '0', 'quota_value': 2000000000},
+        {'quota_type': 'DATASET', 'id': 'QUOTA', 'quota_value': 1073741824}
     ]
     results = POST(f'/pool/dataset/id/{dataset_url}/set_quota', payload)
     assert results.status_code == 200, results.text
@@ -266,3 +266,32 @@ def test_28_delete_zvol():
 def test_29_verify_the_id_zvol_does_not_exist():
     result = GET(f'/pool/dataset/id/{zvol_url}/')
     assert result.status_code == 404, result.text
+
+
+@pytest.mark.parametrize("create_dst", [True, False])
+def test_28_delete_dataset_with_receive_resume_token(create_dst):
+    result = POST('/pool/dataset/', {'name': f'{pool_name}/src'})
+    assert result.status_code == 200, result.text
+
+    if create_dst:
+        result = POST('/pool/dataset/', {'name': f'{pool_name}/dst'})
+        assert result.status_code == 200, result.text
+
+    results = SSH_TEST(f'dd if=/dev/urandom of=/mnt/{pool_name}/src/blob bs=1M count=1', user, password, ip)
+    assert results['result'] is True, results
+    results = SSH_TEST(f'zfs snapshot {pool_name}/src@snap-1', user, password, ip)
+    assert results['result'] is True, results
+    results = SSH_TEST(f'zfs send {pool_name}/src@snap-1 | head -c 102400 | zfs recv -s -F {pool_name}/dst', user, password, ip)
+    results = SSH_TEST(f'zfs get -H -o value receive_resume_token {pool_name}/dst', user, password, ip)
+    assert results['result'] is True, results
+    assert results['output'].strip() != "-", results
+
+    result = DELETE(f'/pool/dataset/id/{pool_name}%2Fsrc/', {
+        'recursive': True,
+    })
+    assert result.status_code == 200, result.text
+
+    result = DELETE(f'/pool/dataset/id/{pool_name}%2Fdst/', {
+        'recursive': True,
+    })
+    assert result.status_code == 200, result.text

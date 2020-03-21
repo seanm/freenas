@@ -826,6 +826,7 @@ class FilesystemService(Service):
             a.strip()
             a.apply(data['path'])
         else:
+            inheritable_is_present = False
             cleaned_acl = []
             lockace_is_present = False
             for entry in dacl:
@@ -836,14 +837,21 @@ class FilesystemService(Service):
                     'perms': self.__convert_to_adv_permset(entry['perms']['BASIC']) if 'BASIC' in entry['perms'] else entry['perms'],
                     'flags': self.__convert_to_adv_flagset(entry['flags']['BASIC']) if 'BASIC' in entry['flags'] else entry['flags'],
                 }
-                if ace['flags']['INHERIT_ONLY'] and not ace['flags'].get('DIRECTORY_INHERIT', False) and not ace['flags'].get('FILE_INHERIT', False):
+                if ace['flags'].get('INHERIT_ONLY') and not ace['flags'].get('DIRECTORY_INHERIT', False) and not ace['flags'].get('FILE_INHERIT', False):
                     raise CallError(
                         'Invalid flag combination. DIRECTORY_INHERIT or FILE_INHERIT must be set if INHERIT_ONLY is set.',
                         errno.EINVAL
                     )
                 if ace['tag'] == 'EVERYONE' and self.__convert_to_basic_permset(ace['perms']) == 'NOPERMS':
                     lockace_is_present = True
+                elif ace['flags'].get('DIRECTORY_INHERIT') or ace['flags'].get('FILE_INHERIT'):
+                    inheritable_is_present = True
+
                 cleaned_acl.append(ace)
+
+            if not inheritable_is_present:
+                raise CallError('At least one inheritable ACL entry is required', errno.EINVAL)
+
             if options['canonicalize']:
                 cleaned_acl = self.canonicalize_acl_order(cleaned_acl)
 

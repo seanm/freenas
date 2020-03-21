@@ -6,11 +6,10 @@ from .pipe import Pipes, Pipe
 from .restful import RESTfulAPI
 from .schema import Error as SchemaError
 from .service_exception import adapt_exception, CallError, CallException, ValidationError, ValidationErrors
-from .utils import start_daemon_thread, LoadPluginsMixin
+from .utils import osc, start_daemon_thread, sw_version, LoadPluginsMixin
 from .utils.debug import get_frame_details, get_threads_stacks
 from .utils.lock import SoftHardSemaphore, SoftHardSemaphoreLimit
 from .utils.io_thread_pool_executor import IoThreadPoolExecutor
-import middlewared.utils.osc as osc
 from .utils.profile import profile_wrap
 from .utils.run_in_thread import RunInThreadMixin
 from .webui_auth import WebUIAuth
@@ -36,7 +35,6 @@ import itertools
 import multiprocessing
 import os
 import pickle
-import platform
 import re
 import queue
 import select
@@ -52,10 +50,10 @@ import types
 import urllib.parse
 import uuid
 
-if platform.system() == "Linux":
-    from systemd.daemon import notify as systemd_notify
-
 from . import logger
+
+if osc.IS_LINUX:
+    from systemd.daemon import notify as systemd_notify
 
 
 class Application(object):
@@ -338,6 +336,12 @@ class Application(object):
         elif message['msg'] == 'unsub':
             await self.unsubscribe(message['id'])
 
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, newstate):
+        pass
+
 
 class FileApplication(object):
 
@@ -555,7 +559,7 @@ class ShellWorkerThread(threading.Thread):
 
             os.chdir('/root')
             cmd = [
-                '/usr/bin/login', '-fp', 'root',
+                '/usr/bin/login', '-p', '-f', 'root',
             ]
 
             if self.jail is not None:
@@ -762,6 +766,7 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
         self.logger = logger.Logger(
             'middlewared', debug_level, log_format
         ).getLogger()
+        self.logger.info('Starting %s middleware', sw_version())
         self.crash_reporting = logger.CrashReporting()
         self.crash_reporting_semaphore = asyncio.Semaphore(value=2)
         self.loop_debug = loop_debug
@@ -796,6 +801,7 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
     def __init_services(self):
         from middlewared.service import CoreService
         self.add_service(CoreService(self))
+        self.event_register('core.environ', 'Send on middleware process environment changes.', private=True)
 
     async def __plugins_load(self):
 
@@ -833,6 +839,10 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
 
             beginning = [
                 'datastore',
+                # Allow internal UNIX socket authentication for plugins that run in separate pools
+                'auth',
+                # We need to register all services because pseudo-services can still be used by plugins setup functions
+                'service',
                 # We run boot plugin first to ensure we are able to retrieve
                 # BOOT POOL during system plugin initialization
                 'boot',
@@ -959,7 +969,7 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
             pass
 
     def __notify_startup_progress(self):
-        if platform.system() == 'FreeBSD':
+        if osc.IS_FREEBSD:
             if self.startup_seq_path is None:
                 return
 
@@ -970,11 +980,11 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
 
             self.startup_seq += 1
 
-        if platform.system() == 'Linux':
+        if osc.IS_LINUX:
             systemd_notify(f'EXTEND_TIMEOUT_USEC={int(240 * 1e6)}')
 
     def __notify_startup_complete(self):
-        if platform.system() == 'Linux':
+        if osc.IS_LINUX:
             systemd_notify('READY=1')
 
     def plugin_route_add(self, plugin_name, route, method):
@@ -1235,10 +1245,14 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
         return itertools.chain(
             self.__events, map(
                 lambda n: (
-                    n[0], {
-                        'description': inspect.getdoc(n[1]), 'wildcard_subscription': False,
+                    n[0],
+                    {
+                        'description': inspect.getdoc(n[1]),
+                        'private': False,
+                        'wildcard_subscription': False,
                     }
-                ), self.__event_sources.items()
+                ),
+                self.__event_sources.items()
             )
         )
 
@@ -1248,19 +1262,19 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
         """
         self.__event_subs[name].append(handler)
 
-    def event_register(self, name, description):
+    def event_register(self, name, description, private=False):
         """
         All events middleware can send should be registered so they are properly documented
         and can be browsed in documentation page without source code inspection.
         """
-        self.__events.register(name, description)
+        self.__events.register(name, description, private=private)
 
     def send_event(self, name, event_type, **kwargs):
 
         if name not in self.__events:
             # We should eventually deny events that are not registered to ensure every event is
             # documented but for backward-compability and safety just log it for now.
-            self.logger.warn(f'Event {name!r} not registered.')
+            self.logger.warning(f'Event {name!r} not registered.')
 
         assert event_type in ('ADDED', 'CHANGED', 'REMOVED')
 

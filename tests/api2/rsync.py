@@ -39,7 +39,8 @@ def test_04_Creating_rsync_task(rsynctask_dict):
         'remotehost': 'foobar',
         'path': '/mnt/tank/share',
         "remotepath": "/share",
-        "remoteport": 22
+        "remoteport": 22,
+        "validate_rpath": False
     }
     results = POST('/rsynctask/', payload)
     assert results.status_code == 200, results.text
@@ -63,7 +64,7 @@ def test_07_Testing_rsync_access():
 
 def test_08_Starting_rsyncd_service():
     results = POST("/service/start/",
-                   {'service': 'rsyncd', 'service-control': {'onetime': True}}
+                   {'service': 'rsync'}
                    )
     assert results.status_code == 200, results.text
     sleep(1)

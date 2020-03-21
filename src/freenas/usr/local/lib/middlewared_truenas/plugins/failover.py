@@ -268,7 +268,7 @@ class FailoverService(ConfigService):
         node = None
 
         proc = subprocess.Popen([
-            '/usr/local/sbin/dmidecode',
+            'dmidecode',
             '-s', 'system-product-name',
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         manufacturer = proc.communicate()[0].strip()
@@ -284,7 +284,7 @@ class FailoverService(ConfigService):
             if proc.returncode == 0:
                 if 'TrueNAS_A' in devlist:
                     node = 'A'
-                else:
+                elif 'TrueNAS_B' in devlist:
                     node = 'B'
 
         else:
@@ -353,7 +353,7 @@ class FailoverService(ConfigService):
             return hardware, node
 
         proc = subprocess.Popen([
-            '/usr/local/sbin/dmidecode',
+            'dmidecode',
             '-s', 'system-serial-number',
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf8')
         serial = proc.communicate()[0].split('\n', 1)[0].strip()
@@ -372,7 +372,7 @@ class FailoverService(ConfigService):
         if license['system_serial'] and license['system_serial_ha']:
             mode = None
             proc = subprocess.Popen([
-                '/usr/local/sbin/dmidecode',
+                'dmidecode',
                 '-s', 'baseboard-product-name',
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf8')
             board = proc.communicate()[0].split('\n', 1)[0].strip()
@@ -723,7 +723,7 @@ class FailoverService(ConfigService):
         reasons = set(self._disabled_reasons(app))
         if reasons != self.LAST_DISABLEDREASONS:
             self.LAST_DISABLEDREASONS = reasons
-            self.middleware.send_event('failover.disabled_reasons', 'CHANGED', fields={'disabled_reasons': reasons})
+            self.middleware.send_event('failover.disabled_reasons', 'CHANGED', fields={'disabled_reasons': list(reasons)})
         return list(reasons)
 
     def _disabled_reasons(self, app):
@@ -785,12 +785,16 @@ class FailoverService(ConfigService):
         """
         local_boot_disks = await self.middleware.call('zfs.pool.get_disks', 'freenas-boot')
         remote_boot_disks = await self.middleware.call('failover.call_remote', 'zfs.pool.get_disks', ['freenas-boot'])
-        local_disks = set(v['ident'] for k, v in
-            (await self.middleware.call('device.get_info', 'DISK')).items()
-            if not k in local_boot_disks)
-        remote_disks = set(v['ident'] for k, v in
-            (await self.middleware.call('failover.call_remote', 'device.get_info', ['DISK'])).items()
-            if not k in remote_boot_disks)
+        local_disks = set(
+            v['ident']
+            for k, v in (await self.middleware.call('device.get_info', 'DISK')).items()
+            if k not in local_boot_disks
+        )
+        remote_disks = set(
+            v['ident']
+            for k, v in (await self.middleware.call('failover.call_remote', 'device.get_info', ['DISK'])).items()
+            if k not in remote_boot_disks
+        )
         return {
             'missing_local': sorted(remote_disks - local_disks),
             'missing_remote': sorted(local_disks - remote_disks),
@@ -1604,6 +1608,9 @@ async def hook_setup_ha(middleware, *args, **kwargs):
     if not await middleware.call('pool.query'):
         return
 
+    # If we have reached this stage make sure status is up to date
+    await middleware.call('failover.status_refresh')
+
     try:
         ha_configured = await middleware.call(
             'failover.call_remote', 'failover.status'
@@ -1616,7 +1623,6 @@ async def hook_setup_ha(middleware, *args, **kwargs):
         if await middleware.call('failover.status') == 'MASTER':
             middleware.logger.debug('[HA] Configuring network on standby node')
             await middleware.call('failover.call_remote', 'interface.sync')
-        await middleware.call('failover.status_refresh')
         return
 
     middleware.logger.info('[HA] Setting up')
@@ -1693,7 +1699,7 @@ async def service_remote(middleware, service, verb, options):
 
     This is the middleware side of what legacy UI did on service changes.
     """
-    if options.get('sync') is False:
+    if not options['ha_propagate']:
         return
     # Skip if service is blacklisted or we are not MASTER
     if service in (
@@ -1708,12 +1714,9 @@ async def service_remote(middleware, service, verb, options):
     if service == 'nginx' and verb == 'stop':
         return
     try:
-        if options.get('wait') is True:
-            await middleware.call('failover.call_remote', f'service.{verb}', [service, options])
-        else:
-            await middleware.call('failover.call_remote', 'core.bulk', [
-                f'service.{verb}', [[service, options]]
-            ])
+        await middleware.call('failover.call_remote', 'core.bulk', [
+            f'service.{verb}', [[service, options]]
+        ])
     except Exception as e:
         if not (isinstance(e, CallError) and e.errno in (errno.ECONNREFUSED, errno.EHOSTDOWN)):
             middleware.logger.warn(f'Failed to run {verb}({service})', exc_info=True)

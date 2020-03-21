@@ -5,7 +5,7 @@ from middlewared.service import (
     item_method, pass_app, private, CRUDService, CallError, ValidationErrors, job
 )
 import middlewared.sqlalchemy as sa
-from middlewared.utils import Nid, Popen, run
+from middlewared.utils import Nid, osc, Popen, run
 from middlewared.utils.asyncio_ import asyncio_map
 from middlewared.utils.path import is_child
 from middlewared.validators import Range
@@ -25,7 +25,6 @@ try:
 except ImportError:
     netif = None
 import os
-import platform
 import psutil
 import random
 import re
@@ -47,7 +46,7 @@ from lxml import etree
 logger = middlewared.logger.Logger('vm').getLogger()
 
 BUFSIZE = 65536
-IS_LINUX = platform.system().lower() == 'linux'
+
 LIBVIRT_URI = 'bhyve+unix:///system'
 LIBVIRT_AVAILABLE_SLOTS = 29  # 3 slots are being used by libvirt / bhyve
 SHUTDOWN_LOCK = asyncio.Lock()
@@ -459,6 +458,8 @@ class VMSupervisor:
                     }
 
                 device_xml = device.xml(child_element=create_element('address', **address_dict))
+            elif isinstance(device, NIC):
+                device_xml = device.xml(slot=pci_slot())
             else:
                 device_xml = device.xml()
 
@@ -651,6 +652,7 @@ class NIC(Device):
                         'mac', address=self.data['attributes']['mac'] if
                         self.data['attributes'].get('mac') else self.random_mac()
                     ),
+                    create_element('address', type='pci', slot=str(kwargs['slot'])),
                 ]
             }
         )
@@ -1412,6 +1414,7 @@ class VMService(CRUDService):
         vm_data = self.middleware.call_sync('vm.get_instance', id)
         self.ensure_libvirt_connection()
         self.vms[vm_data['name']].poweroff()
+        self.middleware.call_sync('vm.teardown_guest_vmemory', id)
 
     @item_method
     @accepts(Int('id'))
@@ -2207,7 +2210,7 @@ async def setup(middleware):
     global ZFS_ARC_MAX_INITIAL
     if sysctl:
         ZFS_ARC_MAX_INITIAL = sysctl.filter('vfs.zfs.arc.max')[0].value
-    if not IS_LINUX:
+    if osc.IS_FREEBSD:
         asyncio.ensure_future(kmod_load())
     asyncio.ensure_future(middleware.call('pool.dataset.register_attachment_delegate',
                                           VMFSAttachmentDelegate(middleware)))

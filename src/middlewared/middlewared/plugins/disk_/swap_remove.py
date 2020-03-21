@@ -1,9 +1,8 @@
-import platform
+import os
 
+from middlewared.utils.osc import IS_LINUX
 from middlewared.service import private, Service
 from middlewared.utils import run
-
-IS_LINUX = platform.system().lower() == 'linux'
 
 
 class DiskService(Service):
@@ -42,9 +41,19 @@ class DiskService(Service):
                     await self.middleware.call('disk.destroy_swap_mirror', mirror['name'])
                     destroyed_mirror = True
 
+        configure_swap = False
         for p in providers.values():
             devname = p['encrypted_provider'] or p['path']
             if devname in swap_devices:
                 await run('swapoff', devname)
             if p['encrypted_provider']:
                 await self.middleware.call('disk.remove_encryption', p['encrypted_provider'])
+            if not IS_LINUX and os.path.realpath('/dev/dumpdev') == p['path']:
+                configure_swap = True
+                try:
+                    os.unlink('/dev/dumpdev')
+                except OSError:
+                    pass
+
+        if configure_swap:
+            await self.middleware.call('disk.swaps_configure')

@@ -12,8 +12,12 @@ import subprocess
 
 try:
     from bsd import geom
+    from nvme import get_nsid
+    import sysctl
 except ImportError:
     geom = None
+    get_nsid = None
+    sysctl = None
 
 from middlewared.schema import Dict, Int, Str, accepts
 from middlewared.service import CallError, CRUDService, filterable, private
@@ -107,6 +111,8 @@ class EnclosureService(CRUDService):
                     })
 
             enclosures.append(enclosure)
+
+        enclosures.extend(self.middleware.call_sync("enclosure.m50_plx_enclosures"))
 
         return filter_list(enclosures, filters=filters or [], options=options or {})
 
@@ -335,13 +341,100 @@ class EnclosureService(CRUDService):
         except IndexError:
             pass
 
+    RE_PCI = re.compile(r"pci([0-9]+)")
+    RE_PCIB = re.compile(r"pcib([0-9]+)")
+    RE_SLOT = re.compile(r"slot=([0-9]+)")
+
+    @private
+    def m50_plx_enclosures(self):
+        system_product = self.middleware.call_sync("system.info")["system_product"]
+        if not ("TRUENAS-M50" in system_product or "TRUENAS-M60" in system_product):
+            return []
+
+        nvme_to_nvd = {}
+        for disk in self.middleware.call_sync("disk.query", [["devname", "^", "nvd"]]):
+            try:
+                n = int(disk["devname"][len("nvd"):])
+            except ValueError:
+                continue
+            nvme = get_nsid(f"/dev/{disk['devname']}")
+            if nvme is not None:
+                nvme_to_nvd[int(nvme[4:])] = n
+
+        slot_to_nvd = {}
+        for nvme, nvd in nvme_to_nvd.items():
+            try:
+                pci = sysctl.filter(f"dev.nvme.{nvme}.%parent")[0].value
+                m = re.match(self.RE_PCI, pci)
+                if not m:
+                    continue
+
+                pcib = sysctl.filter(f"dev.pci.{m.group(1)}.%parent")[0].value
+                m = re.match(self.RE_PCIB, pcib)
+                if not m:
+                    continue
+
+                pnpinfo = sysctl.filter(f"dev.pcib.{m.group(1)}.%pnpinfo")[0].value
+                if "vendor=0x10b5 device=0x8717" not in pnpinfo:
+                    continue
+
+                location = sysctl.filter(f"dev.pcib.{m.group(1)}.%location")[0].value
+                m = re.match(self.RE_SLOT, location)
+                if not m:
+                    continue
+                slot = int(m.group(1))
+            except IndexError:
+                continue
+
+            slot_to_nvd[slot] = f"nvd{nvd}"
+
+        elements = []
+        for slot in range(1, 5):
+            device = slot_to_nvd.get(slot, None)
+
+            if device is not None:
+                status = "OK"
+                value_raw = "0x1000000"
+            else:
+                status = "Not Installed"
+                value_raw = "0x05000000"
+
+            elements.append({
+                "slot": slot,
+                "data": {
+                    "Descriptor": f"Disk #{slot}",
+                    "Status": status,
+                    "Value": "None",
+                    "Device": device,
+                },
+                "name": "Array Device Slot",
+                "descriptor": f"Disk #{slot}",
+                "status": status,
+                "value_raw": value_raw,
+            })
+
+        return [
+            {
+                "id": "m50_plx_enclosure",
+                "name": "Rear NVME U.2 Hotswap Bays",
+                "model": "M50/60 Series",
+                "controller": True,
+                "label": "Rear NVME U.2 Hotswap Bays",
+                "elements": elements,
+            }
+        ]
+
 
 class Enclosures(object):
 
     def __init__(self, stat, labels):
         self.__enclosures = []
         for num, data in stat.items():
-            self.__enclosures.append(Enclosure(num=num, data=data, labels=labels))
+            enclosure = Enclosure(num=num, data=data, labels=labels)
+            if "VirtualSES" in enclosure.encname:
+                continue
+
+            self.__enclosures.append(enclosure)
 
     def __iter__(self):
         for e in list(self.__enclosures):

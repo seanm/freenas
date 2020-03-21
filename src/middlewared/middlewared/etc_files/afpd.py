@@ -1,19 +1,17 @@
 import os
 import textwrap
 
-import netif
-
 from middlewared.client.utils import Struct
+from middlewared.utils import osc
 
 
-def get_interface(ipaddress):
-    get_all_ifaces = netif.list_interfaces()
+def get_interface(middleware, ipaddress):
     ifaces = []
-    for iface in get_all_ifaces.keys():
-        all_ip = [a.__getstate__()['address'] for a in netif.get_interface(iface).addresses if a.af == netif.AddressFamily.INET]
+    for iface in middleware.call_sync('interface.query'):
+        all_ip = [a['address'] for a in iface['aliases'] if a['type'] == 'INET']
         is_ip_exist = list(set(ipaddress).intersection(all_ip))
         if is_ip_exist:
-            ifaces.append(iface)
+            ifaces.append(iface['name'])
 
     return ifaces
 
@@ -33,7 +31,9 @@ def render(service, middleware):
 
     map_acls_mode = False
     ds_type = None
-    afp_config = "/usr/local/etc/afp.conf"
+    afp_config = "/etc/afp.conf"
+    if osc.IS_FREEBSD:
+        afp_config = f'/usr/local{afp_config}'
     cf_contents = []
 
     afp = Struct(middleware.call_sync('datastore.query', 'services.afp', [], {'get': True}))
@@ -49,7 +49,7 @@ def render(service, middleware):
     cf_contents.append('\tuam list = %s\n' % (" ").join(uam_list))
 
     if afp.afp_srv_bindip:
-        ifaces = get_interface(afp.afp_srv_bindip)
+        ifaces = get_interface(middleware, afp.afp_srv_bindip)
         if ifaces:
             cf_contents.append("\tafp listen = %s\n" % ' '.join(afp.afp_srv_bindip))
             cf_contents.append("\tafp interfaces = %s\n" % ' '.join(ifaces))
@@ -128,7 +128,7 @@ def render(service, middleware):
             cf_contents.append("\tldap group attr = %s\n" % "sAMAccountName")
 
     cf_contents.append("\tlog file = %s\n" % "/var/log/afp.log")
-    cf_contents.append("\tlog level = %s\n" % "default:info")
+    cf_contents.append("\tlog level = %s\n" % "default:warn")
     cf_contents.append("\n")
 
     for share in middleware.call_sync('datastore.query', 'sharing.afp_share', [['afp_enabled', '=', True]]):

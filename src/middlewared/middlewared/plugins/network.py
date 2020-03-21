@@ -4,6 +4,7 @@ from middlewared.utils import Popen, filter_list, run
 from middlewared.schema import (Bool, Dict, Int, IPAddr, List, Patch, Ref, Str,
                                 ValidationErrors, accepts)
 import middlewared.sqlalchemy as sa
+from middlewared.utils import osc
 from middlewared.validators import Match, Range
 
 import asyncio
@@ -11,20 +12,17 @@ from collections import defaultdict
 import contextlib
 import ipaddress
 import itertools
-import os
 import platform
 import random
 import re
 import socket
 import string
 import subprocess
-import urllib.request
 
 from .interface.netif import netif
 from .interface.type_base import InterfaceType
 
 
-IS_LINUX = platform.system().lower() == 'linux'
 RE_NAMESERVER = re.compile(r'^nameserver\s+(\S+)', re.M)
 RE_MTU = re.compile(r'\bmtu\s+(\d+)')
 ANNOUNCE_SRV = {
@@ -274,7 +272,7 @@ class NetworkConfigurationService(ConfigService):
                 restart_nfs = True
 
             for service_to_reload in services_to_reload:
-                await self.middleware.call('service.reload', service_to_reload, {'onetime': False})
+                await self.middleware.call('service.reload', service_to_reload)
             if restart_nfs:
                 await self._service_change('nfs', 'restart')
 
@@ -994,7 +992,7 @@ class InterfaceService(CRUDService):
                     await self.middleware.call('interface.validate_name', InterfaceType.LINK_AGGREGATION, data['name'])
                 except ValueError as e:
                     verrors.add(f'{schema_name}.name', str(e))
-            if data['lag_protocol'] not in await self.middleware.call('interface.lagg_supported_protocols'):
+            if data['lag_protocol'] not in await self.middleware.call('interface.lag_supported_protocols'):
                 verrors.add(
                     f'{schema_name}.lag_protocol',
                     f'{platform.system()} does not support LAGG protocol {data["lag_protocol"]}',
@@ -1527,7 +1525,7 @@ class InterfaceService(CRUDService):
 
         for line in (await run("sockstat", "-46", encoding="utf-8")).stdout.split("\n")[1:]:
             line = line.split()
-            if platform.system() == "Linux":
+            if osc.IS_LINUX:
                 line.pop()  # STATE column
             local_address = line[-2]
             foreign_address = line[-1]
@@ -1708,7 +1706,8 @@ class InterfaceService(CRUDService):
         for lagg in laggs:
             name = lagg['lagg_interface']['int_interface']
             members = await self.middleware.call('datastore.query', 'network.lagginterfacemembers',
-                                                 [('lagg_interfacegroup_id', '=', lagg['id'])])
+                                                 [('lagg_interfacegroup_id', '=', lagg['id'])],
+                                                 {'order_by': ['lagg_physnic']})
             disable_capabilities = name in disable_capabilities_ifaces
 
             cloned_interfaces.append(name)
@@ -1805,7 +1804,7 @@ class InterfaceService(CRUDService):
     )
     def ip_in_use(self, choices=None):
         """
-        Get all IPv4 / Ipv6 from all valid interfaces, excluding bridge, tap and epair.
+        Get all IPv4 / Ipv6 from all valid interfaces, excluding tap and epair.
 
         `loopback` will return loopback interface addresses.
 
@@ -1831,7 +1830,7 @@ class InterfaceService(CRUDService):
 
         """
         list_of_ip = []
-        ignore_nics = ['bridge', 'tap', 'epair', 'pflog']
+        ignore_nics = ['tap', 'epair', 'pflog']
         if not choices['loopback']:
             ignore_nics.append('lo')
         ignore_nics = tuple(ignore_nics)
@@ -2203,17 +2202,11 @@ async def configure_http_proxy(middleware, *args, **kwargs):
     """
     gc = await middleware.call('datastore.config', 'network.globalconfiguration')
     http_proxy = gc['gc_httpproxy']
-    if http_proxy:
-        os.environ['http_proxy'] = http_proxy
-        os.environ['https_proxy'] = http_proxy
-    elif not http_proxy:
-        if 'http_proxy' in os.environ:
-            del os.environ['http_proxy']
-        if 'https_proxy' in os.environ:
-            del os.environ['https_proxy']
-
-    # Reset global opener so ProxyHandler can be recalculated
-    urllib.request.install_opener(None)
+    update = {
+        'http_proxy': http_proxy,
+        'https_proxy': http_proxy,
+    }
+    await middleware.call('core.environ_update', update)
 
 
 async def attach_interface(middleware, iface):
@@ -2253,11 +2246,13 @@ async def udevd_ifnet_hook(middleware, data):
 
 
 async def setup(middleware):
+    middleware.event_register('network.config', 'Sent on network configuration changes.')
+
     # Configure http proxy on startup and on network.config events
     asyncio.ensure_future(configure_http_proxy(middleware))
     middleware.event_subscribe('network.config', configure_http_proxy)
 
-    if IS_LINUX:
+    if osc.IS_LINUX:
         middleware.register_hook('udev.net', udevd_ifnet_hook)
     else:
         # Listen to IFNET events so we can sync on interface attach

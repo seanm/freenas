@@ -1,13 +1,13 @@
 from mako import exceptions
 from mako.lookup import TemplateLookup
 from middlewared.service import Service
+from middlewared.utils import osc
 from middlewared.utils.io import write_if_changed
 
 import asyncio
 import grp
 import imp
 import os
-import platform
 import pwd
 
 
@@ -37,8 +37,10 @@ class MakoRenderer(object):
                 # Render the template
                 return tmpl.render(
                     middleware=self.service.middleware,
+                    service=self.service,
                     FileShouldNotExist=FileShouldNotExist,
-                    platform=platform.system(),
+                    IS_FREEBSD=osc.IS_FREEBSD,
+                    IS_LINUX=osc.IS_LINUX,
                 )
 
             return await self.service.middleware.run_in_thread(do)
@@ -70,8 +72,11 @@ class PyRenderer(object):
 
 class EtcService(Service):
 
+    APACHE_DIR = 'local/apache24' if osc.IS_FREEBSD else 'local/apache2'
+
     GROUPS = {
         'user': [
+            {'type': 'mako', 'path': 'local/smbusername.map'},
             {'type': 'mako', 'path': 'group', 'platform': 'FreeBSD'},
             {'type': 'mako', 'path': 'master.passwd', 'platform': 'FreeBSD'},
             {'type': 'py', 'path': 'pwd_db', 'platform': 'FreeBSD'},
@@ -84,10 +89,14 @@ class EtcService(Service):
             {'type': 'py', 'path': 'afpd'},
         ],
         'cron': [
-            {'type': 'mako', 'path': 'crontab'},
+            {'type': 'mako', 'path': 'cron.d/middlewared'},
+            {'type': 'mako', 'path': 'crontab', 'platform': 'FreeBSD'},
         ],
         'ctld': [
             {'type': 'py', 'path': 'ctld', 'platform': 'FreeBSD'},
+        ],
+        'grub': [
+            {'type': 'py', 'path': 'grub', 'platform': 'Linux'},
         ],
         'ldap': [
             {'type': 'mako', 'path': 'local/openldap/ldap.conf'},
@@ -136,9 +145,21 @@ class EtcService(Service):
             {'type': 'py', 'path': 'generate_ssl_certs'},
         ],
         'webdav': [
-            {'type': 'mako', 'path': 'local/apache24/httpd.conf'},
-            {'type': 'mako', 'path': 'local/apache24/Includes/webdav.conf'},
-            {'type': 'py', 'path': 'local/apache24/webdav_config'},
+            {
+                'type': 'mako',
+                'local_path': 'local/apache24/httpd.conf',
+                'path': f'{APACHE_DIR}/httpd.conf',
+            },
+            {
+                'type': 'mako',
+                'local_path': f'local/apache24/Includes/webdav.conf',
+                'path': f'{APACHE_DIR}/Includes/webdav.conf',
+            },
+            {
+                'type': 'py',
+                'local_path': f'local/apache24/webdav_config',
+                'path': f'{APACHE_DIR}/webdav_config',
+            },
         ],
         'nginx': [
             {'type': 'mako', 'path': 'local/nginx/nginx.conf'}
@@ -180,14 +201,11 @@ class EtcService(Service):
         ],
         'smb': [
             {'type': 'mako', 'path': 'local/smb4.conf'},
+            {'type': 'mako', 'path': 'security/pam_winbind.conf'},
         ],
         'smb_share': [
             {'type': 'mako', 'path': 'local/smb4_share.conf'},
             {'type': 'py', 'path': 'local/smb4_share_load'}
-        ],
-        'smb_configure': [
-            {'type': 'mako', 'path': 'local/smbusername.map'},
-            {'type': 'py', 'path': 'smb_configure'},
         ],
         'snmpd': [
             {'type': 'mako', 'path': 'local/snmpd.conf'},
@@ -221,7 +239,7 @@ class EtcService(Service):
         ],
         'ttys': [
             {'type': 'mako', 'path': 'ttys', 'platform': 'FreeBSD'},
-            {'type': 'py', 'path': 'ttys_config', 'platform': 'FreeBSD'}
+            {'type': 'py', 'path': 'ttys_config'}
         ],
         'openvpn_server': [
             {'type': 'mako', 'path': 'local/openvpn/server/openvpn_server.conf'}
@@ -234,7 +252,9 @@ class EtcService(Service):
         ]
     }
 
-    SKIP_LIST = ['system_dataset', 'collectd', 'mdns', 'syslogd', 'smb_configure', 'nginx']
+    SKIP_LIST = [
+        'system_dataset', 'mdns', 'syslogd', 'nginx'
+    ] + (['ttys'] if osc.IS_LINUX else [])
 
     class Config:
         private = True
@@ -260,12 +280,12 @@ class EtcService(Service):
             if renderer is None:
                 raise ValueError(f'Unknown type: {entry["type"]}')
 
-            if 'platform' in entry and entry['platform'] != platform.system():
+            if 'platform' in entry and entry['platform'].upper() != osc.SYSTEM:
                 continue
 
-            path = os.path.join(self.files_dir, entry['path'])
+            path = os.path.join(self.files_dir, entry.get('local_path') or entry['path'])
             entry_path = entry['path']
-            if platform.system() == 'Linux':
+            if osc.IS_LINUX:
                 if entry_path.startswith('local/'):
                     entry_path = entry_path[len('local/'):]
             outfile = f'/etc/{entry_path}'

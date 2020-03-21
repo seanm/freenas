@@ -6,6 +6,7 @@ import asyncio
 import random
 import aiohttp
 import hashlib
+import os
 
 
 class UsageService(Service):
@@ -24,7 +25,8 @@ class UsageService(Service):
                     await session.post(
                         'https://usage.freenas.org/submit',
                         data=gather,
-                        headers={"Content-type": "application/json"}
+                        headers={"Content-type": "application/json"},
+                        proxy=os.environ.get("http_proxy"),
                     )
             except Exception as e:
                 # We still want to schedule the next call
@@ -304,7 +306,6 @@ class UsageService(Service):
                             'recyclebin': s['recyclebin'],
                             'shadowcopy': s['shadowcopy'],
                             'guestok': s['guestok'],
-                            'guestonly': s['guestonly'],
                             'abe': s['abe'],
                             'acl': s['acl'],
                             'fsrvp': s['fsrvp'],

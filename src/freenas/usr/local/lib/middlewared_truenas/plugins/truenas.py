@@ -9,9 +9,6 @@ import errno
 import json
 import os
 
-
-from licenselib.license import ContractType
-
 from middlewared.schema import accepts, Bool, Dict, Str
 from middlewared.service import Service, private
 import middlewared.sqlalchemy as sa
@@ -61,6 +58,8 @@ class TrueNASService(Service):
         TRUENAS-M40-S
         TRUENAS-M50-HA
         TRUENAS-M50-S
+        TRUENAS-M60-HA
+        TRUENAS-M60-S
         TRUENAS-Z20-S
         TRUENAS-Z20-HA-D
         TRUENAS-Z30-HA-D

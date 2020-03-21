@@ -14,14 +14,13 @@ Example:
 import argparse
 import atexit
 import os
-import platform
 import shlex
 import subprocess
 import sys
 
 from middlewared.client import Client
 
-c = Client()
+c = Client('ws+unix:///var/run/middlewared-internal.sock')
 if c.call('system.is_freenas'):
     TRUENAS = False
 else:
@@ -46,38 +45,19 @@ def cleanup():
         pass
 
 
-# 32, 64, etc.
-ARCH_WIDTH = int(platform.architecture()[0].replace('bit', ''))
-
 LOADER_CONF = '/boot/loader.conf'
 SYSCTL_CONF = '/etc/sysctl.conf'
 
 # We need 3GB(x86)/6GB(x64) on a properly spec'ed system for our middleware
 # for the system to function comfortably, with a little kernel memory to spare
 # for other things.
-if ARCH_WIDTH == 32:
+DEFAULT_USERLAND_RESERVED_MEM = USERLAND_RESERVED_MEM = int(2.25 * GiB)
 
-    DEFAULT_USERLAND_RESERVED_MEM = USERLAND_RESERVED_MEM = int(1.00 * GiB)
+DEFAULT_KERNEL_RESERVED_MEM = KERNEL_RESERVED_MEM = 768 * MiB
 
-    DEFAULT_KERNEL_RESERVED_MEM = KERNEL_RESERVED_MEM = 384 * MiB
+MIN_KERNEL_RESERVED_MEM = 128 * MiB
 
-    MIN_KERNEL_RESERVED_MEM = 64 * MiB
-
-    MIN_ZFS_RESERVED_MEM = 512 * MiB
-
-elif ARCH_WIDTH == 64:
-
-    DEFAULT_USERLAND_RESERVED_MEM = USERLAND_RESERVED_MEM = int(2.25 * GiB)
-
-    DEFAULT_KERNEL_RESERVED_MEM = KERNEL_RESERVED_MEM = 768 * MiB
-
-    MIN_KERNEL_RESERVED_MEM = 128 * MiB
-
-    MIN_ZFS_RESERVED_MEM = 1024 * MiB
-
-else:
-
-    sys.exit('Architecture bit-width (%d) not supported' % (ARCH_WIDTH, ))
+MIN_ZFS_RESERVED_MEM = 1024 * MiB
 
 
 def popen(cmd):
@@ -128,7 +108,6 @@ DEF_KNOBS = {
         'vfs.zfs.vdev.sync_read_max_active',
         'vfs.zfs.vdev.async_write_max_active',
         'vfs.zfs.vdev.sync_write_max_active',
-        'vfs.zfs.top_maxinflight',
         'vfs.zfs.zfetch.max_distance',
     },
 }
@@ -147,13 +126,7 @@ def guess_kern_ipc_maxsockbuf():
     Higher -> better throughput, but greater the likelihood of wasted bandwidth
     and memory use/chance for starvation with a larger number of connections.
     """
-    if TRUENAS and (hardware[0] == "Z50" or hardware[0] == "Z35"):
-        return 16 * MiB
-    elif TRUENAS and hardware[0] == "Z30":
-        return 8 * MiB
-    elif TRUENAS and hardware[0] == "Z20":
-        return 4 * MiB
-    elif HW_PHYSMEM_GiB > 180:
+    if HW_PHYSMEM_GiB > 180:
         return 16 * MiB
     elif HW_PHYSMEM_GiB > 84:
         return 8 * MiB
@@ -231,13 +204,7 @@ def guess_net_inet_tcp_mssdflt():
 
 
 def guess_net_inet_tcp_recvspace():
-    if TRUENAS and (hardware[0] == "Z50" or hardware[0] == "Z35"):
-        return 1 * MiB
-    elif TRUENAS and hardware[0] == "Z30":
-        return 512 * KiB
-    elif TRUENAS and hardware[0] == "Z20":
-        return 256 * KiB
-    elif HW_PHYSMEM_GiB > 180:
+    if HW_PHYSMEM_GiB > 180:
         return 1 * MiB
     elif HW_PHYSMEM_GiB > 84:
         return 512 * KiB
@@ -248,13 +215,7 @@ def guess_net_inet_tcp_recvspace():
 
 
 def guess_net_inet_tcp_sendspace():
-    if TRUENAS and (hardware[0] == "Z50" or hardware[0] == "Z35"):
-        return 1 * MiB
-    elif TRUENAS and hardware[0] == "Z30":
-        return 512 * KiB
-    elif TRUENAS and hardware[0] == "Z20":
-        return 256 * KiB
-    elif HW_PHYSMEM_GiB > 180:
+    if HW_PHYSMEM_GiB > 180:
         return 1 * MiB
     elif HW_PHYSMEM_GiB > 84:
         return 512 * KiB
@@ -296,13 +257,6 @@ def guess_vfs_zfs_vdev_async_write_max_active():
 def guess_vfs_zfs_vdev_sync_write_max_active():
     if TRUENAS and hardware[0] == "Z50":
         return 64
-    else:
-        return None
-
-
-def guess_vfs_zfs_top_maxinflight():
-    if TRUENAS and hardware[0] == "Z50":
-        return 256
     else:
         return None
 

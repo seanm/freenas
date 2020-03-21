@@ -10,7 +10,7 @@ import os
 from time import sleep
 apifolder = os.getcwd()
 sys.path.append(apifolder)
-from functions import PUT, POST, GET, DELETE, SSH_TEST
+from functions import PUT, POST, GET, DELETE, SSH_TEST, wait_on_job
 from auto_config import ip, pool_name, password, user
 
 MOUNTPOINT = "/tmp/smb-cifs"
@@ -95,6 +95,7 @@ def test_002_creating_smb_dataset():
 
 
 def test_003_changing_dataset_permissions_of_smb_dataset():
+    global job_id
     payload = {
         "acl": smb_acl,
         "user": "shareuser",
@@ -102,25 +103,31 @@ def test_003_changing_dataset_permissions_of_smb_dataset():
     }
     results = POST(f"/pool/dataset/id/{dataset_url}/permission/", payload)
     assert results.status_code == 200, results.text
+    job_id = results.json()
 
 
-def test_004_get_filesystem_stat_from_smb_path_and_verify_acl_is_true():
+def test_004_verify_the_job_id_is_successfull():
+    job_status = wait_on_job(job_id, 180)
+    assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+
+
+def test_005_get_filesystem_stat_from_smb_path_and_verify_acl_is_true():
     results = POST('/filesystem/stat/', smb_path)
     assert results.status_code == 200, results.text
     assert results.json()['acl'] is True, results.text
 
 
-def test_005_starting_cifs_service_at_boot():
+def test_006_starting_cifs_service_at_boot():
     results = PUT("/service/id/cifs/", {"enable": True})
     assert results.status_code == 200, results.text
 
 
-def test_006_checking_to_see_if_clif_service_is_enabled_at_boot():
+def test_007_checking_to_see_if_clif_service_is_enabled_at_boot():
     results = GET("/service?service=cifs")
     assert results.json()[0]["enable"] is True, results.text
 
 
-def test_007_creating_a_smb_share_path():
+def test_008_creating_a_smb_share_path():
     global payload, results, smb_id
     payload = {
         "comment": "My Test SMB Share",
@@ -134,15 +141,8 @@ def test_007_creating_a_smb_share_path():
     smb_id = results.json()['id']
 
 
-def test_008_verify_if_smb_getparm_path_homes_is_null():
-    cmd = 'midclt call smb.getparm path homes'
-    results = SSH_TEST(cmd, user, password, ip)
-    assert results['result'] is True, results['output']
-    assert results['output'].strip() == 'null'
-
-
 def test_009_starting_cifs_service():
-    payload = {"service": "cifs", "service-control": {"onetime": True}}
+    payload = {"service": "cifs"}
     results = POST("/service/start/", payload)
     assert results.status_code == 200, results.text
     sleep(1)
@@ -515,7 +515,7 @@ def test_059_verify_smb_getparm_path_homes():
 
 
 def test_060_stoping_clif_service():
-    payload = {"service": "cifs", "service-control": {"onetime": True}}
+    payload = {"service": "cifs"}
     results = POST("/service/stop/", payload)
     assert results.status_code == 200, results.text
     sleep(1)
@@ -539,7 +539,7 @@ def test_063_update_cifs_share():
 
 
 def test_064_starting_cifs_service():
-    payload = {"service": "cifs", "service-control": {"onetime": True}}
+    payload = {"service": "cifs"}
     results = POST("/service/start/", payload)
     assert results.status_code == 200, results.text
     sleep(1)
@@ -666,13 +666,6 @@ def test_081_verify_smb_getparm_vfs_objects_share(vfs_object):
     results = SSH_TEST(cmd, user, password, ip)
     assert results['result'] is True, results['output']
     assert vfs_object in results['output'], results['output']
-
-
-def test_082_verify_smb_getparm_fruit_volume_uuid_share():
-    cmd = f'midclt call smb.getparm "fruit:volume_uuid" {SMB_NAME}'
-    results = SSH_TEST(cmd, user, password, ip)
-    assert results['result'] is True, results['output']
-    assert results['output'].strip() == vuid, results['output']
 
 
 def test_083_verify_smb_getparm_fruit_time_machine_is_yes():
@@ -844,11 +837,11 @@ def test_105_verify_smbclient_127_0_0_1_connection():
     assert 'My Test SMB Share' in results['output'], results['output']
 
 
-def test_106_verify_midclt_call_smb_getparm_access_based_share_enum_is_true():
+def test_106_verify_midclt_call_smb_getparm_access_based_share_enum_is_null():
     cmd = f'midclt call smb.getparm "access based share enum" {SMB_NAME}'
     results = SSH_TEST(cmd, user, password, ip)
     assert results['result'] is True, results['output']
-    assert results['output'].strip() == 'False', results['output']
+    assert results['output'].strip() == 'null', results['output']
 
 
 def test_107_delete_cifs_share():
@@ -868,7 +861,7 @@ def test_109_checking_to_see_if_clif_service_is_enabled_at_boot():
 
 
 def test_110_stoping_clif_service():
-    payload = {"service": "cifs", "service-control": {"onetime": True}}
+    payload = {"service": "cifs"}
     results = POST("/service/stop/", payload)
     assert results.status_code == 200, results.text
     sleep(1)

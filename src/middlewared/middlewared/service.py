@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 
+from middlewared.common.environ import environ_update
 import middlewared.main
 from middlewared.schema import accepts, Bool, Dict, Int, List, Ref, Str
 from middlewared.service_exception import CallException, CallError, ValidationError, ValidationErrors  # noqa
@@ -277,7 +278,7 @@ class ServiceChangeMixin:
         await self.middleware.call('etc.generate', 'rc')
 
         if svc_state == 'running':
-            started = await self.middleware.call(f'service.{verb}', service, {'onetime': True})
+            started = await self.middleware.call(f'service.{verb}', service)
 
             if not started:
                 raise CallError(
@@ -847,10 +848,14 @@ class CoreService(Service):
         """
         events = {}
         for name, attrs in self.middleware.get_events():
+            if attrs['private']:
+                continue
+
             events[name] = {
                 'description': attrs['description'],
                 'wildcard_subscription': attrs['wildcard_subscription'],
             }
+
         return events
 
     @private
@@ -1035,3 +1040,21 @@ class CoreService(Service):
             job.set_progress(current_progress)
 
         return statuses
+
+    _environ = {}
+
+    @private
+    async def environ(self):
+        return self._environ
+
+    @private
+    async def environ_update(self, update):
+        environ_update(update)
+
+        for k, v in update.items():
+            if v is None:
+                self._environ.pop(k, None)
+            else:
+                self._environ[k] = v
+
+        self.middleware.send_event('core.environ', 'CHANGED', fields=update)
