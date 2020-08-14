@@ -1,10 +1,11 @@
 import asyncio
-import imp
+import importlib
 import inspect
 import itertools
+import logging
 import os
-import re
 import sys
+import re
 import subprocess
 import threading
 from datetime import datetime, timedelta
@@ -17,6 +18,8 @@ from middlewared.utils import osc
 
 BUILDTIME = None
 VERSION = None
+
+logger = logging.getLogger(__name__)
 
 
 def bisect(condition, iterable):
@@ -32,7 +35,6 @@ def bisect(condition, iterable):
 
 
 def Popen(args, **kwargs):
-    kwargs.setdefault('encoding', 'utf8')
     shell = kwargs.pop('shell', None)
     if shell:
         return asyncio.create_subprocess_shell(args, **kwargs)
@@ -46,13 +48,15 @@ async def run(*args, **kwargs):
     kwargs.setdefault('stdout', subprocess.PIPE)
     kwargs.setdefault('stderr', subprocess.PIPE)
     check = kwargs.pop('check', True)
+    encoding = kwargs.pop('encoding', None)
+    errors = kwargs.pop('errors', None) or 'strict'
     proc = await asyncio.create_subprocess_exec(*args, **kwargs)
     stdout, stderr = await proc.communicate()
-    if "encoding" in kwargs:
+    if encoding:
         if stdout is not None:
-            stdout = stdout.decode(kwargs["encoding"], kwargs.get("errors") or "strict")
+            stdout = stdout.decode(encoding, errors)
         if stderr is not None:
-            stderr = stderr.decode(kwargs["encoding"], kwargs.get("errors") or "strict")
+            stderr = stderr.decode(encoding, errors)
     cp = subprocess.CompletedProcess(args, proc.returncode, stdout=stdout, stderr=stderr)
     if check:
         cp.check_returncode()
@@ -109,10 +113,10 @@ def filter_list(_list, filters=None, options=None):
         'nin': lambda x, y: x not in y,
         'rin': lambda x, y: x is not None and y in x,
         'rnin': lambda x, y: x is not None and y not in x,
-        '^': lambda x, y: x.startswith(y),
-        '!^': lambda x, y: not x.startswith(y),
-        '$': lambda x, y: x.endswith(y),
-        '!$': lambda x, y: not x.endswith(y),
+        '^': lambda x, y: x is not None and x.startswith(y),
+        '!^': lambda x, y: x is not None and not x.startswith(y),
+        '$': lambda x, y: x is not None and x.endswith(y),
+        '!$': lambda x, y: x is not None and not x.endswith(y),
     }
 
     if filters is None:
@@ -307,11 +311,24 @@ class cache_with_autorefresh(object):
 
 
 def load_modules(directory, base=None, depth=0):
+    directory = os.path.normpath(directory)
     if base is None:
-        base = '.'.join(
-            ['middlewared'] +
-            os.path.relpath(directory, os.path.dirname(os.path.dirname(__file__))).split('/')
-        )
+        middlewared_root = os.path.dirname(os.path.dirname(__file__))
+        if os.path.commonprefix((f'{directory}/', f'{middlewared_root}/')) == f'{middlewared_root}/':
+            base = '.'.join(
+                ['middlewared'] +
+                os.path.relpath(directory, middlewared_root).split('/')
+            )
+        else:
+            for new_module_path in sys.path:
+                if os.path.commonprefix((f'{directory}/', f'{new_module_path}/')) == f'{new_module_path}/':
+                    break
+            else:
+                new_module_path = os.path.dirname(directory)
+                logger.debug("Registering new module path %r", new_module_path)
+                sys.path.insert(0, new_module_path)
+
+            base = '.'.join(os.path.relpath(directory, new_module_path).split('/'))
 
     _, dirs, files = next(os.walk(directory))
 
@@ -329,18 +346,13 @@ def load_modules(directory, base=None, depth=0):
         else:
             mod_name = f'{base}.{name}'
 
-        if mod_name in sys.modules:
-            yield sys.modules[mod_name]
-        else:
-            fp, pathname, description = imp.find_module(name, [directory])
-            try:
-                yield imp.load_module(mod_name, fp, pathname, description)
-            finally:
-                if fp:
-                    fp.close()
+        yield importlib.import_module(mod_name)
 
     for f in dirs:
         if depth > 0:
+            if f.endswith(('_freebsd', '_linux')):
+                if f.rsplit('_', 1)[-1].upper() != osc.SYSTEM:
+                    continue
             path = os.path.join(directory, f)
             yield from load_modules(path, f'{base}.{f}', depth - 1)
 
@@ -390,7 +402,8 @@ class LoadPluginsMixin(object):
                 if on_module_end:
                     on_module_end(mod)
 
-        key = lambda service: service._config.namespace
+        def key(service):
+            return service._config.namespace
         for name, parts in itertools.groupby(sorted(set(services), key=key), key=key):
             parts = list(parts)
 
@@ -406,6 +419,9 @@ class LoadPluginsMixin(object):
 
         # Now that all plugins have been loaded we can resolve all method params
         # to make sure every schema is patched and references match
+        self._resolve_methods()
+
+    def _resolve_methods(self):
         from middlewared.schema import resolve_methods  # Lazy import so namespace match
         to_resolve = []
         for service in list(self._services.values()):

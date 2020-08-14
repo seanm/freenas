@@ -18,7 +18,9 @@ class InterfaceService(Service):
         namespace_alias = 'interfaces'
 
     @private
-    def configure(self, data, aliases, wait_dhcp=False, **kwargs):
+    def configure(self, data, aliases, wait_dhcp=False, options=None):
+        options = options or {}
+
         name = data['int_interface']
 
         iface = netif.get_interface(name)
@@ -119,21 +121,36 @@ class InterfaceService(Service):
             iface.nd6_flags = iface.nd6_flags | {netif.NeighborDiscoveryFlags.IFDISABLED}
             iface.nd6_flags = iface.nd6_flags - {netif.NeighborDiscoveryFlags.AUTO_LINKLOCAL}
 
+        if dhclient_running and not data['int_dhcp']:
+            self.logger.debug('Killing dhclient for {}'.format(name))
+            os.kill(dhclient_pid, signal.SIGTERM)
+
         # Remove addresses configured and not in database
-        for addr in (addrs_configured - addrs_database):
+        for addr in addrs_configured:
             if has_ipv6 and str(addr.address).startswith('fe80::'):
                 continue
-            self.logger.debug('{}: removing {}'.format(name, addr))
-            iface.remove_address(addr)
+            if addr not in addrs_database:
+                self.logger.debug('{}: removing {}'.format(name, addr))
+                iface.remove_address(addr)
+            else:
+                if osc.IS_LINUX and not data['int_dhcp']:
+                    self.logger.debug('{}: removing possible valid_lft and preferred_lft on {}'.format(name, addr))
+                    iface.replace_address(addr)
 
         # carp must be configured after removing addresses
         # in case removing the address removes the carp
         if carp_vhid:
-            if not self.middleware.call_sync('system.is_freenas') and not advskew:
-                if self.middleware.call_sync('failover.node') == 'A':
+            if self.middleware.call_sync('failover.licensed') and not advskew:
+                if 'NO_FAILOVER' in self.middleware.call_sync('failover.disabled_reasons'):
+                    if self.middleware.call_sync('failover.vip.get_states')[0]:
+                        advskew = 20
+                    else:
+                        advskew = 80
+                elif self.middleware.call_sync('failover.node') == 'A':
                     advskew = 20
                 else:
                     advskew = 80
+
             # FIXME: change py-netif to accept str() key
             iface.carp_config = [netif.CarpConfig(carp_vhid, advskew=advskew, key=carp_pass.encode())]
 
@@ -154,7 +171,7 @@ class InterfaceService(Service):
 
         # In case there is no MTU in interface and it is currently
         # different than the default of 1500, revert it
-        if not kwargs.get('skip_mtu'):
+        if not options.get('skip_mtu'):
             if data['int_mtu']:
                 if iface.mtu != data['int_mtu']:
                     iface.mtu = data['int_mtu']
@@ -173,16 +190,13 @@ class InterfaceService(Service):
         # If dhclient is not running and dhcp is configured, lets start it
         if not dhclient_running and data['int_dhcp']:
             self.logger.debug('Starting dhclient for {}'.format(name))
-            self.middleware.call_sync('interface.dhclient_start', data['int_interface'], wait_dhcp, wait=wait_dhcp)
-        elif dhclient_running and not data['int_dhcp']:
-            self.logger.debug('Killing dhclient for {}'.format(name))
-            os.kill(dhclient_pid, signal.SIGTERM)
+            self.middleware.call_sync('interface.dhclient_start', data['int_interface'], wait_dhcp)
 
         if osc.IS_FREEBSD:
             if data['int_ipv6auto']:
                 iface.nd6_flags = iface.nd6_flags | {netif.NeighborDiscoveryFlags.ACCEPT_RTADV}
-                subprocess.call(['/etc/rc.d/rtsold', 'onestart'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                close_fds=True)
+                subprocess.call(['/etc/rc.d/rtsold', 'onerestart'], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, close_fds=True)
             else:
                 iface.nd6_flags = iface.nd6_flags - {netif.NeighborDiscoveryFlags.ACCEPT_RTADV}
 

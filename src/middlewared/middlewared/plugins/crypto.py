@@ -3,6 +3,7 @@ import dateutil
 import dateutil.parser
 import inspect
 import ipaddress
+import itertools
 import josepy as jose
 import json
 import os
@@ -286,12 +287,18 @@ class CryptoKeyService(Service):
                     'Please enable ca when key_cert_sign is set in KeyUsage as per RFC 5280.'
                 )
 
+        if extensions_data['ExtendedKeyUsage']['enabled'] and not extensions_data['ExtendedKeyUsage']['usages']:
+            verrors.add(
+                f'{schema}.ExtendedKeyUsage.usages',
+                'Please specify at least one USAGE for this extension.'
+            )
+
         return verrors
 
     def validate_cert_with_chain(self, cert, chain):
         check_cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert)
         store = crypto.X509Store()
-        for chain_cert in chain:
+        for chain_cert in itertools.chain.from_iterable(map(lambda c: RE_CERTIFICATE.findall(c), chain)):
             store.add_cert(
                 crypto.load_certificate(crypto.FILETYPE_PEM, chain_cert)
             )
@@ -415,7 +422,8 @@ class CryptoKeyService(Service):
             'extensions': {},
         }
 
-        for ext in (
+        for ext in filter(
+            lambda e: e.get_short_name().decode() != 'UNDEF',
             map(
                 lambda i: obj.get_extension(i),
                 range(obj.get_extension_count())
@@ -424,9 +432,16 @@ class CryptoKeyService(Service):
             if 'subjectAltName' == ext.get_short_name().decode():
                 cert_info['san'] = [s.strip() for s in ext.__str__().split(',') if s]
 
-            cert_info['extensions'][
-                re.sub(r"^(\S)", lambda m: m.group(1).upper(), ext.get_short_name().decode())
-            ] = ext.__str__()
+            try:
+                ext_name = re.sub(r"^(\S)", lambda m: m.group(1).upper(), ext.get_short_name().decode())
+                cert_info['extensions'][ext_name] = 'Unable to parse extension'
+                cert_info['extensions'][ext_name] = ext.__str__()
+            except crypto.Error as e:
+                # some certificates can have extensions with binary data which we can't parse without
+                # explicit mapping for each extension. The current case covers the most of extensions nicely
+                # and if it's required to map certain extensions which can't be handled by above we can do
+                # so as users request.
+                self.middleware.logger.error('Unable to parse extension: %s', e)
 
         dn = []
         for k, v in obj.get_subject().get_components():
@@ -460,9 +475,12 @@ class CryptoKeyService(Service):
                 'country_name': 'US',
                 'organization_name': 'iXsystems',
                 'common_name': 'localhost',
-                'email_address': 'info@ixsystems.com'
+                'email_address': 'info@ixsystems.com',
+                'state_or_province_name': 'Tennessee',
+                'locality_name': 'Maryville',
             },
-            'lifetime': NOT_VALID_AFTER_DEFAULT
+            'lifetime': NOT_VALID_AFTER_DEFAULT,
+            'san': self.normalize_san(['localhost'])
         })
         key = self.generate_private_key({
             'serialize': False,
@@ -472,6 +490,8 @@ class CryptoKeyService(Service):
 
         cert = cert.public_key(
             key.public_key()
+        ).add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), False
         ).sign(
             key, hashes.SHA256(), default_backend()
         )
@@ -548,10 +568,10 @@ class CryptoKeyService(Service):
             Str('city', required=True),
             Str('organization', required=True),
             Str('organizational_unit'),
-            Str('common', required=True),
+            Str('common', null=True),
             Str('email', validators=[Email()], required=True),
             Str('digest_algorithm', enum=['SHA1', 'SHA224', 'SHA256', 'SHA384', 'SHA512']),
-            List('san', items=[Str('san')], null=True),
+            List('san', items=[Str('san')], required=True, empty=False),
             Dict(
                 'cert_extensions',
                 Dict(
@@ -569,7 +589,7 @@ class CryptoKeyService(Service):
                 ),
                 Dict(
                     'ExtendedKeyUsage',
-                    List('usages', items=[Str('usage', enum=EKU_OIDS)]),
+                    List('usages', items=[Str('usage', enum=EKU_OIDS)], default=[]),
                     Bool('enabled', default=False),
                     Bool('extension_critical', default=False)
                 ),
@@ -682,20 +702,7 @@ class CryptoKeyService(Service):
 
         cert = self.generate_builder(builder_data)
 
-        cert = cert.add_extension(
-            x509.BasicConstraints(True, 0 if ca_key else None), True
-        ).add_extension(
-            x509.KeyUsage(
-                digital_signature=False, content_commitment=False, key_encipherment=False, data_encipherment=False,
-                key_agreement=False, key_cert_sign=True, crl_sign=True, encipher_only=False, decipher_only=False
-            ), True
-        ).add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False
-        ).add_extension(
-            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), False
-        ).public_key(
-            key.public_key()
-        )
+        cert = self.add_extensions(cert, data.get('cert_extensions'), key, issuer)
 
         cert = cert.sign(
             ca_key or key, self.retrieve_signing_algorithm(data, ca_key or key), default_backend()
@@ -935,7 +942,7 @@ class CertificateModel(sa.Model):
     cert_type = sa.Column(sa.Integer())
     cert_name = sa.Column(sa.String(120))
     cert_certificate = sa.Column(sa.Text(), nullable=True)
-    cert_privatekey = sa.Column(sa.Text(), nullable=True)
+    cert_privatekey = sa.Column(sa.EncryptedText(), nullable=True)
     cert_CSR = sa.Column(sa.Text(), nullable=True)
     cert_signedby_id = sa.Column(sa.ForeignKey('system_certificateauthority.id'), index=True, nullable=True)
     cert_acme_uri = sa.Column(sa.String(200), nullable=True)
@@ -953,7 +960,7 @@ class CertificateService(CRUDService):
         datastore_prefix = 'cert_'
 
     PROFILES = {
-        'openvpn_server_certificate': {
+        'Openvpn Server Certificate': {
             'cert_extensions': {
                 'BasicConstraints': {
                     'enabled': True,
@@ -984,7 +991,7 @@ class CertificateService(CRUDService):
             'lifetime': NOT_VALID_AFTER_DEFAULT,
             'digest_algorithm': 'SHA256'
         },
-        'openvpn_client_certificate': {
+        'Openvpn Client Certificate': {
             'cert_extensions': {
                 'BasicConstraints': {
                     'enabled': True,
@@ -1174,6 +1181,8 @@ class CertificateService(CRUDService):
             else:
                 self.logger.debug(f'Failed to load privatekey of {cert["name"]}', exc_info=True)
                 cert['key_length'] = cert['key_type'] = None
+        else:
+            cert['key_length'] = cert['key_type'] = None
 
         if cert['type'] == CERT_TYPE_CSR:
             csr_data = await self.middleware.call('cryptokey.load_certificate_request', cert['CSR'])
@@ -1228,7 +1237,12 @@ class CertificateService(CRUDService):
                     f'{cert["name"]} certificate is malformed'
                 )
 
-            if not cert['key_length']:
+            if not cert['privatekey']:
+                verrors.add(
+                    schema_name,
+                    'Selected certificate does not have a private key'
+                )
+            elif not cert['key_length']:
                 verrors.add(
                     schema_name,
                     'Failed to parse certificate\'s private key'
@@ -1266,7 +1280,7 @@ class CertificateService(CRUDService):
     @private
     async def get_domain_names(self, cert_id):
         data = await self._get_instance(int(cert_id))
-        names = [data['common']]
+        names = [data['common']] if data['common'] else []
         names.extend(data['san'])
         return names
 
@@ -1530,7 +1544,7 @@ class CertificateService(CRUDService):
             Str('acme_directory_uri'),
             Str('certificate', max_length=None),
             Str('city'),
-            Str('common', max_length=None),
+            Str('common', max_length=None, null=True),
             Str('country'),
             Str('CSR', max_length=None),
             Str('ec_curve', enum=CryptoKeyService.ec_curves, default=CryptoKeyService.ec_curve_default),
@@ -1852,7 +1866,7 @@ class CertificateService(CRUDService):
             ('edit', _set_required('city')),
             ('edit', _set_required('organization')),
             ('edit', _set_required('email')),
-            ('edit', _set_required('common')),
+            ('edit', _set_required('san')),
             ('edit', _set_required('signedby')),
             ('rm', {'name': 'create_type'}),
             register=True
@@ -2060,7 +2074,7 @@ class CertificateAuthorityModel(sa.Model):
     cert_type = sa.Column(sa.Integer())
     cert_name = sa.Column(sa.String(120))
     cert_certificate = sa.Column(sa.Text(), nullable=True)
-    cert_privatekey = sa.Column(sa.Text(), nullable=True)
+    cert_privatekey = sa.Column(sa.EncryptedText(), nullable=True)
     cert_CSR = sa.Column(sa.Text(), nullable=True)
     cert_revoked_date = sa.Column(sa.DateTime(), nullable=True)
     cert_signedby_id = sa.Column(sa.ForeignKey('system_certificateauthority.id'), index=True, nullable=True)
@@ -2074,7 +2088,7 @@ class CertificateAuthorityService(CRUDService):
         datastore_prefix = 'cert_'
 
     PROFILES = {
-        'openvpn_root_ca': {
+        'Openvpn Root CA': {
             'cert_extensions': {
                 'AuthorityKeyIdentifier': {
                     'enabled': True,
@@ -2091,6 +2105,13 @@ class CertificateAuthorityService(CRUDService):
                     'enabled': True,
                     'ca': True,
                     'extension_critical': True
+                },
+                'ExtendedKeyUsage': {
+                    'enabled': True,
+                    'extension_critical': False,
+                    'usages': [
+                        'SERVER_AUTH', 'CLIENT_AUTH',
+                    ]
                 }
             },
             'key_length': 2048,
@@ -2098,7 +2119,7 @@ class CertificateAuthorityService(CRUDService):
             'lifetime': NOT_VALID_AFTER_DEFAULT,
             'digest_algorithm': 'SHA256'
         },
-        'ca': {
+        'CA': {
             'key_length': 2048,
             'key_type': 'RSA',
             'lifetime': NOT_VALID_AFTER_DEFAULT,
@@ -2114,6 +2135,11 @@ class CertificateAuthorityService(CRUDService):
                     'enabled': True,
                     'ca': True,
                     'extension_critical': True
+                },
+                'ExtendedKeyUsage': {
+                    'enabled': True,
+                    'extension_critical': False,
+                    'usages': ['SERVER_AUTH']
                 }
             }
         }
@@ -2284,12 +2310,13 @@ class CertificateAuthorityService(CRUDService):
 
     def _set_cert_extensions_defaults(name):
         def set_defaults(attr):
-            for ext, keys in (
-                ('BasicConstraints', ('enabled', 'ca', 'extension_critical')),
-                ('KeyUsage', ('enabled', 'key_cert_sign', 'crl_sign', 'extension_critical'))
+            for ext, keys, values in (
+                ('BasicConstraints', ('enabled', 'ca', 'extension_critical'), [True] * 3),
+                ('KeyUsage', ('enabled', 'key_cert_sign', 'crl_sign', 'extension_critical'), [True] * 4),
+                ('ExtendedKeyUsage', ('enabled', 'usages'), (True, ['SERVER_AUTH']))
             ):
-                for k in keys:
-                    attr.attrs[ext].attrs[k].default = True
+                for k, v in zip(keys, values):
+                    attr.attrs[ext].attrs[k].default = v
 
         return {'name': name, 'method': set_defaults}
 
@@ -2590,7 +2617,7 @@ class CertificateAuthorityService(CRUDService):
             ('edit', _set_required('city')),
             ('edit', _set_required('organization')),
             ('edit', _set_required('email')),
-            ('edit', _set_required('common')),
+            ('edit', _set_required('san')),
             ('rm', {'name': 'create_type'}),
             register=True
         )

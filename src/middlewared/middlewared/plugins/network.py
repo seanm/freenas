@@ -5,6 +5,7 @@ from middlewared.schema import (Bool, Dict, Int, IPAddr, List, Patch, Ref, Str,
                                 ValidationErrors, accepts)
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc
+from middlewared.utils.generate import random_string
 from middlewared.validators import Match, Range
 
 import asyncio
@@ -12,11 +13,11 @@ from collections import defaultdict
 import contextlib
 import ipaddress
 import itertools
+import os
 import platform
-import random
 import re
+import signal
 import socket
-import string
 import subprocess
 
 from .interface.netif import netif
@@ -30,6 +31,9 @@ ANNOUNCE_SRV = {
     'netbios': 'nmbd',
     'wsd': 'wsdd'
 }
+
+RE_RTSOLD_INTERFACE = re.compile(r'Interface (.+)')
+RE_RTSOLD_NUMBER_OF_VALID_RAS = re.compile(r'number of valid RAs: ([0-9]+)')
 
 
 class NetworkConfigurationModel(sa.Model):
@@ -394,8 +398,11 @@ class InterfaceService(CRUDService):
                 continue
             if not is_freenas and name in internal_ifaces:
                 continue
+            iface_extend_kwargs = {}
+            if osc.IS_LINUX:
+                iface_extend_kwargs = dict(media=True)
             try:
-                data[name] = self.iface_extend(iface.__getstate__(), configs, is_freenas)
+                data[name] = self.iface_extend(iface.__getstate__(**iface_extend_kwargs), configs, is_freenas)
             except OSError:
                 self.logger.warn('Failed to get interface state for %s', name, exc_info=True)
         for name, config in filter(lambda x: x[0] not in data, configs.items()):
@@ -677,6 +684,13 @@ class InterfaceService(CRUDService):
         # We do not check for failover disabled in here because we may be reverting
         # the first time HA is being set up and this was already checked during commit.
         await self.__restore_datastores()
+
+        # All entries are deleted from the network tables on a rollback operation.
+        # This breaks `failover.status` on TrueNAS HA systems.
+        # Because of this, we need to manually sync the database to the standby
+        # controller.
+        await self.middleware.call_hook('interface.post_rollback')
+
         await self.sync()
 
     @accepts()
@@ -753,8 +767,8 @@ class InterfaceService(CRUDService):
             ),
         ], default=[]),
         Bool('failover_critical', default=False),
-        Int('failover_group'),
-        Int('failover_vhid'),
+        Int('failover_group', null=True),
+        Int('failover_vhid', null=True, validators=[Range(min=1, max=255)]),
         List('failover_aliases', items=[Ref('interface_alias')]),
         List('failover_virtual_aliases', items=[Ref('interface_alias')]),
         List('bridge_members'),
@@ -906,6 +920,16 @@ class InterfaceService(CRUDService):
         else:
             filters = []
 
+        validation_attrs = {
+            'alias': ['Active node IP address', ' cannot be changed.', ' is required when configuring HA'],
+            'failover_aliases': ['Standby node IP address', ' cannot be changed.', ' is required when configuring HA'],
+            'failover_virtual_aliases': ['Virtual IP address', ' cannot be changed.', ' is required when configuring HA'],
+            'failover_group': ['Failover group number', ' cannot be changed.' ' is required when configuring HA'],
+            'mtu': ['MTU', ' cannot be changed.'],
+            'ipv4_dhcp': ['DHCP', ' cannot be changed.'],
+            'ipv6_auto': ['Autconfig for IPv6', ' cannot be changed.'],
+        }
+
         ifaces = {
             i['name']: i
             for i in await self.middleware.call('interface.query', filters)
@@ -949,13 +973,14 @@ class InterfaceService(CRUDService):
 
         if itype == 'PHYSICAL':
             if data['name'] in lag_used:
-                for i in ('aliases', 'mtu', 'ipv4_dhcp', 'ipv6_auto'):
-                    if data.get(i):
+                lag_name = lag_used.get(data['name'])
+                for k, v in validation_attrs.items():
+                    if data.get(k):
                         verrors.add(
-                            f'{schema_name}.{i}',
-                            f'Interface in use by {data["name"]}. Attribute {i} cannot be changed'
-                            ' on members interfaces.',
+                            f'{schema_name}.{k}',
+                            f'Interface in use by {lag_name}. {str(v[0]) + str(v[1])}'
                         )
+
         elif itype == 'BRIDGE':
             if 'name' in data:
                 try:
@@ -1044,14 +1069,10 @@ class InterfaceService(CRUDService):
                     if mtu and mtu > (parent_iface.get('mtu') or 1500):
                         verrors.add(
                             f'{schema_name}.mtu',
-                            f'VLAN MTU cannot be bigger than parent interface.',
+                            'VLAN MTU cannot be bigger than parent interface.',
                         )
 
-        failover_licensed = False
-        is_freenas = await self.middleware.call('system.is_freenas')
-        if not is_freenas:
-            failover_licensed = await self.middleware.call('failover.licensed')
-        if is_freenas or not failover_licensed:
+        if not await self.middleware.call('failover.licensed'):
             data.pop('failover_critical', None)
             data.pop('failover_group', None)
             data.pop('failover_aliases', None)
@@ -1065,24 +1086,45 @@ class InterfaceService(CRUDService):
                     'Failover needs to be disabled to perform network configuration changes.'
                 )
 
-            found = True
-            for i in (
-                'failover_critical', 'failover_group', 'failover_aliases', 'failover_vhid',
-            ):
-                if i not in data:
-                    verrors.add(
-                        f'{schema_name}.{i}',
-                        'This attribute is required when configuring HA.',
-                    )
-                    found = False
-            if found:
-                if len(data['aliases']) != len(data['failover_aliases']):
+                # have to make sure that active, standby and virtual ip addresses are equal
+                active_node_ips = len(data.get('aliases', []))
+                standby_node_ips = len(data.get('failover_aliases', []))
+                virtual_node_ips = len(data.get('failover_virtual_aliases', []))
+                are_equal = active_node_ips == standby_node_ips == virtual_node_ips
+                if not are_equal:
                     verrors.add(
                         f'{schema_name}.failover_aliases',
-                        'Number of IPs must be the same between controllers.',
+                        'You must specify an active, standby and virtual IP address.'
                     )
 
-                if not update or update.get('failover_vhid') != data['failover_vhid']:
+                if not update:
+                    failover_attrs = set(
+                        [k for k, v in validation_attrs.items() if k not in ('mtu', 'ipv4_dhcp', 'ipv6_auto')]
+                    )
+                    configured_attrs = set([i for i in failover_attrs if data.get(i)])
+
+                    if configured_attrs:
+                        for i in failover_attrs - configured_attrs:
+                            verrors.add(
+                                f'{schema_name}.{i}',
+                                f'{str(validation_attrs[i][0]) + str(validation_attrs[i][2])}',
+                            )
+
+                # can't remove VHID and not GROUP
+                if not data['failover_vhid'] and data['failover_group']:
+                    verrors.add(
+                        f'{schema_name}.failover_vhid',
+                        'Removing only the VHID is not allowed.'
+                    )
+
+                # can't remove GROUP and not VHID
+                if not data['failover_group'] and data['failover_vhid']:
+                    verrors.add(
+                        f'{schema_name}.failover_group',
+                        'Removing only the failover group is not allowed.'
+                    )
+
+                if update.get('failover_vhid') != data['failover_vhid']:
                     used_vhids = set()
                     for v in (await self.middleware.call(
                         'interface.scan_vrrp', data['name'], None, 5,
@@ -1094,12 +1136,6 @@ class InterfaceService(CRUDService):
                             f'{schema_name}.failover_vhid',
                             f'The following VHIDs are already in use: {used_vhids}.'
                         )
-
-                if data['failover_critical'] and not data['failover_group']:
-                    verrors.add(
-                        f'{schema_name}.failover_group',
-                        'This attribute is required for critical failover interfaces.',
-                    )
 
     def __validate_aliases(self, verrors, schema_name, data, ifaces):
         for i, alias in enumerate(data.get('aliases') or []):
@@ -1124,19 +1160,33 @@ class InterfaceService(CRUDService):
                     break
 
     async def __convert_interface_datastore(self, data):
+
+        """
+        If there is no password for VRRP/CARP, then we generate
+        a random string to be used as the password.
+
+        If FreeBSD, then generate a CARP password of length 16 chars.
+
+        If Linux, then generate a VRRP password of length 8 chars.
+        VRRP only allows 8 char long passwords for the type of
+        authentication that is used.
+        """
+
+        passwd = ''
+        if not data.get('failover_pass') and data.get('failover_vhid'):
+            if osc.IS_FREEBSD:
+                passwd = random_string(string_size=16)
+            else:
+                passwd = random_string()
+        else:
+            passwd = data.get('failover_pass', '')
+
         return {
             'name': data.get('description') or '',
             'dhcp': data['ipv4_dhcp'],
             'ipv6auto': data['ipv6_auto'],
             'vhid': data.get('failover_vhid'),
-            # CARP password needs to be automatically generated if there isn't one
-            'pass': ''.join([
-                random.SystemRandom().choice(
-                    string.ascii_letters + string.digits
-                ) for n in range(16)
-            ])
-            if not data.get('failover_pass') and data.get('failover_vhid')
-            else data.get('failover_pass', ''),
+            'pass': passwd,
             'critical': data.get('failover_critical') or False,
             'group': data.get('failover_group'),
             'options': data.get('options', ''),
@@ -1451,15 +1501,10 @@ class InterfaceService(CRUDService):
     async def do_delete(self, oid):
         """
         Delete Interface of `id`.
-
-        It should be noted that only virtual interfaces can be deleted.
         """
         await self.__check_failover_disabled()
 
         iface = await self._get_instance(oid)
-
-        if iface['type'] == 'PHYSICAL':
-            raise CallError('Only virtual interfaces can be deleted.')
 
         await self.__save_datastores()
 
@@ -1498,9 +1543,6 @@ class InterfaceService(CRUDService):
         await self.middleware.call(
             'datastore.delete', 'network.interfaces', [('int_interface', '=', oid)]
         )
-
-        # Let's finally delete the interface
-        await self.middleware.call('interface.destroy', oid)
 
         return oid
 
@@ -1722,22 +1764,40 @@ class InterfaceService(CRUDService):
             await self.middleware.call('interface.vlan_setup', vlan, disable_capabilities, parent_interfaces)
 
         bridges = await self.middleware.call('datastore.query', 'network.bridge')
+        # Considering a scenario where we have the network configuration
+        # physical iface -> vlan -> bridge
+        # If all these interfaces are set to have 9000 MTU, we won't be able to set that up on boot
+        # unless physical iface has a 9000 MTU when the bridge is being setup.
+        # To address such scenarios, we divide the approach in 4 steps:
+        # 1) Remove orphaned members from bridge
+        # 2) Sync all non-bridge interfaces ( in this order physical ifaces -> laggs -> vlans )
+        # 3) Setup bridge with MTU
+        # 4) Sync bridge interfaces
+
+        for bridge in bridges:
+            await self.middleware.call('interface.pre_bridge_setup', bridge, sync_interface_opts)
+
+        # Set VLAN interfaces MTU last as they are restricted by underlying interfaces MTU
+        for interface in sorted(
+            filter(lambda i: not i.startswith('bridge'), interfaces), key=lambda x: x.startswith('vlan')
+        ):
+            try:
+                await self.sync_interface(interface, wait_dhcp, sync_interface_opts[interface])
+            except Exception:
+                self.logger.error('Failed to configure {}'.format(interface), exc_info=True)
+
         for bridge in bridges:
             name = bridge['interface']['int_interface']
 
             cloned_interfaces.append(name)
             await self.middleware.call('interface.bridge_setup', bridge)
+            # Finally sync bridge interface
+            try:
+                await self.sync_interface(name, wait_dhcp, sync_interface_opts[name])
+            except Exception:
+                self.logger.error('Failed to configure {}'.format(name), exc_info=True)
 
         self.logger.info('Interfaces in database: {}'.format(', '.join(interfaces) or 'NONE'))
-        # Configure VLAN before BRIDGE so MTU is configured in correct order
-        for interface in sorted(
-            interfaces,
-            key=lambda x: 2 if x.startswith('bridge') else (1 if x.startswith('vlan') else 0)
-        ):
-            try:
-                await self.sync_interface(interface, wait_dhcp, **sync_interface_opts[interface])
-            except Exception:
-                self.logger.error('Failed to configure {}'.format(interface), exc_info=True)
 
         internal_interfaces = ['lo', 'pflog', 'pfsync', 'tun', 'tap', 'epair']
         if not await self.middleware.call('system.is_freenas'):
@@ -1780,7 +1840,9 @@ class InterfaceService(CRUDService):
         await self.middleware.call_hook('interface.post_sync')
 
     @private
-    async def sync_interface(self, name, wait_dhcp=False, **kwargs):
+    async def sync_interface(self, name, wait_dhcp=False, options=None):
+        options = options or {}
+
         try:
             data = await self.middleware.call('datastore.query', 'network.interfaces', [('int_interface', '=', name)], {'get': True})
         except IndexError:
@@ -1789,7 +1851,7 @@ class InterfaceService(CRUDService):
 
         aliases = await self.middleware.call('datastore.query', 'network.alias', [('alias_interface_id', '=', data['id'])])
 
-        await self.middleware.call('interface.configure', data, aliases, wait_dhcp, **kwargs)
+        await self.middleware.call('interface.configure', data, aliases, wait_dhcp, options)
 
     @accepts(
         Dict(
@@ -1961,8 +2023,22 @@ class RouteService(Service):
         elif routing_table.default_route_ipv6:
             # If there is no gateway in database but one is configured
             # remove it
-            self.logger.info('Removing IPv6 default route')
-            routing_table.delete(routing_table.default_route_ipv6)
+            interface = routing_table.default_route_ipv6.interface
+            autoconfigured_interface = await self.middleware.call(
+                'datastore.query', 'network.interfaces', [
+                    ['int_interface', '=', interface],
+                    ['int_ipv6auto', '=', True],
+                ]
+            )
+            remove = False
+            if not autoconfigured_interface:
+                self.logger.info('Removing IPv6 default route as there is no IPv6 autoconfiguration')
+                remove = True
+            elif not await self.middleware.call('route.has_valid_router_announcements', interface):
+                self.logger.info('Removing IPv6 default route as IPv6 autoconfiguration has not succeeded')
+                remove = True
+            if remove:
+                routing_table.delete(routing_table.default_route_ipv6)
 
     @accepts(Str('ipv4_gateway'))
     def ipv4gw_reachable(self, ipv4_gateway):
@@ -1980,6 +2056,54 @@ class RouteService(Service):
                         ipv4_nic = ipaddress.IPv4Interface(nic_address)
                         if ipaddress.ip_address(ipv4_gateway) in ipv4_nic.network:
                             return True
+        return False
+
+    @private
+    async def has_valid_router_announcements(self, interface):
+        rtsold_dump_path = '/var/run/rtsold.dump'
+
+        try:
+            with open('/var/run/rtsold.pid') as f:
+                rtsold_pid = int(f.read().strip())
+        except (FileNotFoundError, ValueError):
+            self.logger.warning('rtsold pid file does not exist')
+            return False
+
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(rtsold_dump_path)
+
+        try:
+            os.kill(rtsold_pid, signal.SIGUSR1)
+        except ProcessLookupError:
+            self.logger.warning('rtsold is not running')
+            return False
+
+        for i in range(10):
+            await asyncio.sleep(0.2)
+            try:
+                with open(rtsold_dump_path) as f:
+                    dump = f.readlines()
+                    break
+            except FileNotFoundError:
+                continue
+        else:
+            self.logger.warning('rtsold has not dumped status')
+            return False
+
+        current_interface = None
+        for line in dump:
+            line = line.strip()
+
+            m = RE_RTSOLD_INTERFACE.match(line)
+            if m:
+                current_interface = m.group(1)
+
+            if current_interface == interface:
+                m = RE_RTSOLD_NUMBER_OF_VALID_RAS.match(line)
+                if m:
+                    return int(m.group(1)) > 0
+
+        self.logger.warning('Have not found %s status in rtsold dump', interface)
         return False
 
 
@@ -2002,7 +2126,7 @@ class StaticRouteService(CRUDService):
         'staticroute_create',
         IPAddr('destination', network=True),
         IPAddr('gateway', allow_zone_index=True),
-        Str('description'),
+        Str('description', default=''),
         register=True
     ))
     async def do_create(self, data):
@@ -2021,7 +2145,7 @@ class StaticRouteService(CRUDService):
             'datastore.insert', self._config.datastore, data,
             {'prefix': self._config.datastore_prefix})
 
-        await self.middleware.call('service.start', 'routing')
+        await self.middleware.call('service.restart', 'routing')
 
         return await self._get_instance(id)
 
@@ -2041,14 +2165,14 @@ class StaticRouteService(CRUDService):
         new = old.copy()
         new.update(data)
 
-        self._validate('staticroute_update', data)
+        self._validate('staticroute_update', new)
 
-        await self.lower(data)
+        await self.lower(new)
         await self.middleware.call(
-            'datastore.update', self._config.datastore, id, data,
+            'datastore.update', self._config.datastore, id, new,
             {'prefix': self._config.datastore_prefix})
 
-        await self.middleware.call('service.start', 'routing')
+        await self.middleware.call('service.restart', 'routing')
 
         return await self._get_instance(id)
 
@@ -2060,17 +2184,41 @@ class StaticRouteService(CRUDService):
         staticroute = self.middleware.call_sync('staticroute._get_instance', id)
         rv = self.middleware.call_sync('datastore.delete', self._config.datastore, id)
         try:
-            ip_interface = ipaddress.ip_interface(staticroute['destination'])
             rt = netif.RoutingTable()
-            rt.delete(netif.Route(
-                str(ip_interface.ip), str(ip_interface.netmask), gateway=staticroute['gateway']
-            ))
+            rt.delete(self._netif_route(staticroute))
         except Exception as e:
             self.logger.warn(
                 'Failed to delete static route %s: %s', staticroute['destination'], e,
             )
 
         return rv
+
+    @private
+    def sync(self):
+        rt = netif.RoutingTable()
+
+        new_routes = [self._netif_route(route) for route in self.middleware.call_sync('staticroute.query')]
+
+        default_route_ipv4 = rt.default_route_ipv4
+        default_route_ipv6 = rt.default_route_ipv6
+        for route in rt.routes:
+            if route in new_routes:
+                new_routes.remove(route)
+                continue
+
+            if route not in [default_route_ipv4, default_route_ipv6] and route.gateway is not None:
+                self.logger.debug('Removing route %r', route.__getstate__())
+                try:
+                    rt.delete(route)
+                except Exception as e:
+                    self.logger.warning('Failed to remove route: %r', e)
+
+        for route in new_routes:
+            self.logger.debug('Adding route %r', route.__getstate__())
+            try:
+                rt.add(route)
+            except Exception as e:
+                self.logger.warning('Failed to add route: %r', e)
 
     @private
     async def lower(self, data):
@@ -2090,6 +2238,12 @@ class StaticRouteService(CRUDService):
 
         if verrors:
             raise verrors
+
+    def _netif_route(self, staticroute):
+        ip_interface = ipaddress.ip_interface(staticroute['destination'])
+        return netif.Route(
+            str(ip_interface.ip), str(ip_interface.netmask), gateway=staticroute['gateway']
+        )
 
 
 class DNSService(Service):

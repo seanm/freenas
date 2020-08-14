@@ -149,7 +149,6 @@ class PeriodicSnapshotTaskService(CRUDService):
             {'prefix': self._config.datastore_prefix}
         )
 
-        await self.middleware.call('service.restart', 'cron')
         await self.middleware.call('zettarepl.update_tasks')
 
         return await self._get_instance(data['id'])
@@ -215,8 +214,6 @@ class PeriodicSnapshotTaskService(CRUDService):
 
         if verrors:
             raise verrors
-        if verrors:
-            raise verrors
 
         Cron.convert_schedule_to_db_format(new, begin_end=True)
 
@@ -231,7 +228,6 @@ class PeriodicSnapshotTaskService(CRUDService):
             {'prefix': self._config.datastore_prefix}
         )
 
-        await self.middleware.call('service.restart', 'cron')
         await self.middleware.call('zettarepl.update_tasks')
 
         return await self._get_instance(id)
@@ -275,7 +271,6 @@ class PeriodicSnapshotTaskService(CRUDService):
             id
         )
 
-        await self.middleware.call('service.restart', 'cron')
         await self.middleware.call('zettarepl.update_tasks')
 
         return response
@@ -321,8 +316,9 @@ class PeriodicSnapshotTaskService(CRUDService):
 class PeriodicSnapshotTaskFSAttachmentDelegate(FSAttachmentDelegate):
     name = 'snapshottask'
     title = 'Snapshot Task'
+    resource_name = 'dataset'
 
-    async def query(self, path, enabled):
+    async def query(self, path, enabled, options=None):
         results = []
         for task in await self.middleware.call('pool.snapshottask.query', [['enabled', '=', enabled]]):
             if is_child(os.path.join('/mnt', task['dataset']), path):
@@ -330,21 +326,16 @@ class PeriodicSnapshotTaskFSAttachmentDelegate(FSAttachmentDelegate):
 
         return results
 
-    async def get_attachment_name(self, attachment):
-        return attachment['dataset']
-
     async def delete(self, attachments):
         for attachment in attachments:
             await self.middleware.call('datastore.delete', 'storage.task', attachment['id'])
 
-        await self.middleware.call('service.restart', 'cron')
         await self.middleware.call('zettarepl.update_tasks')
 
     async def toggle(self, attachments, enabled):
         for attachment in attachments:
             await self.middleware.call('datastore.update', 'storage.task', attachment['id'], {'task_enabled': enabled})
 
-        await self.middleware.call('service.restart', 'cron')
         await self.middleware.call('zettarepl.update_tasks')
 
 

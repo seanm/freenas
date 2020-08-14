@@ -1,12 +1,9 @@
-from middlewared.common.attachment import FSAttachmentDelegate
+from middlewared.common.attachment import LockableFSAttachmentDelegate
 from middlewared.schema import Bool, Dict, IPAddr, List, Str, Int, Patch
-from middlewared.service import (SystemServiceService, ValidationErrors,
-                                 accepts, job, private, CRUDService)
-from middlewared.async_validators import check_path_resides_within_volume
+from middlewared.service import accepts, job, private, SharingService, SystemServiceService, ValidationErrors
 from middlewared.service_exception import CallError
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc, Popen, run
-from middlewared.utils.path import is_child
 
 import asyncio
 import codecs
@@ -18,7 +15,8 @@ import subprocess
 import uuid
 
 try:
-    from samba import param
+    from samba.samba3 import param
+    from samba.samba3 import passdb
 except ImportError:
     param = None
 
@@ -31,6 +29,8 @@ LOGLEVEL_MAP = {
     '10': 'DEBUG',
 }
 RE_NETBIOSNAME = re.compile(r"^[a-zA-Z0-9\.\-_!@#\$%^&\(\)'\{\}~]{1,15}$")
+
+LP_CTX = param.get_context()
 
 
 class SMBHAMODE(enum.IntEnum):
@@ -48,6 +48,7 @@ class SMBCmd(enum.Enum):
     NET = 'net'
     PDBEDIT = 'pdbedit'
     SHARESEC = 'sharesec'
+    SMBCACLS = 'smbcacls'
     SMBCONTROL = 'smbcontrol'
     SMBPASSWD = 'smbpasswd'
     STATUS = 'smbstatus'
@@ -67,16 +68,17 @@ class SMBBuiltin(enum.Enum):
 
 
 class SMBPath(enum.Enum):
-    GLOBALCONF = ('/usr/local/etc/smb4.conf', '/etc/smb.conf', 0o755, False)
-    SHARECONF = ('/usr/local/etc/smb4_share.conf', '/etc/smb_share.conf', 0o755, False)
+    GLOBALCONF = ('/usr/local/etc/smb4.conf', '/etc/smb4.conf', 0o755, False)
+    SHARECONF = ('/usr/local/etc/smb4_share.conf', '/etc/smb4_share.conf', 0o755, False)
     STATEDIR = ('/var/db/system/samba4', '/var/db/system/samba4', 0o755, True)
-    PRIVATEDIR = ('/var/db/system/samba4/private', '/var/db/system/samba4', 0o700, True)
+    PRIVATEDIR = ('/var/db/system/samba4/private', '/var/db/system/samba4/private', 0o700, True)
     LEGACYSTATE = ('/root/samba', '/root/samba', 0o755, True)
     LEGACYPRIVATE = ('/root/samba/private', '/root/samba/private', 0o700, True)
     MSG_SOCK = ('/var/db/system/samba4/private/msg.sock', '/var/db/system/samba4/msg.sock', 0o700, False)
     RUNDIR = ('/var/run/samba4', '/var/run/samba', 0o755, True)
     LOCKDIR = ('/var/lock', '/var/lock', 0o755, True)
     LOGDIR = ('/var/log/samba4', '/var/log/samba', 0o755, True)
+    IPCSHARE = ('/var/tmp', '/tmp', 0o1777, True)
 
     def platform(self):
         return self.value[1] if osc.IS_LINUX else self.value[0]
@@ -105,7 +107,7 @@ class SMBSharePreset(enum.Enum):
         'aapl_name_mangling': False,
         'acl': True,
         'durablehandle': True,
-        'shadowcopy': True,
+        'shadowcopy': osc.IS_FREEBSD,  # shadowcopy only available for FreeBSD (for now)
         'streams': True,
         'fsrvp': False,
         'auxsmbconf': '',
@@ -130,7 +132,7 @@ class SMBSharePreset(enum.Enum):
             'streams_xattr:prefix = user.',
             'streams_xattr:store_stream_type = no',
             'oplocks = no',
-            'level 2 oplocks = no',
+            'level2 oplocks = no',
             'strict locking = auto',
         ])
     }}
@@ -140,7 +142,7 @@ class SMBSharePreset(enum.Enum):
         'durablehandle': False,
         'auxsmbconf': '\n'.join([
             'oplocks = no',
-            'level 2 oplocks = no',
+            'level2 oplocks = no',
             'strict locking = yes',
         ])
     }}
@@ -176,11 +178,13 @@ class SMBModel(sa.Model):
     cifs_srv_filemask = sa.Column(sa.String(120))
     cifs_srv_dirmask = sa.Column(sa.String(120))
     cifs_srv_smb_options = sa.Column(sa.Text())
-    cifs_srv_bindip = sa.Column(sa.MultiSelectField(), nullable=True)
+    cifs_srv_bindip = sa.Column(sa.MultiSelectField())
     cifs_SID = sa.Column(sa.String(120), nullable=True)
     cifs_srv_ntlmv1_auth = sa.Column(sa.Boolean(), default=False)
     cifs_srv_enable_smb1 = sa.Column(sa.Boolean(), default=False)
     cifs_srv_admin_group = sa.Column(sa.String(120), nullable=True, default="")
+    cifs_srv_next_rid = sa.Column(sa.Integer(), nullable=False)
+    cifs_srv_secrets = sa.Column(sa.EncryptedText(), nullable=True)
 
 
 class WBCErr(enum.Enum):
@@ -217,6 +221,8 @@ class SMBService(SystemServiceService):
         smb['netbiosalias'] = (smb['netbiosalias'] or '').split()
 
         smb['loglevel'] = LOGLEVEL_MAP.get(smb['loglevel'])
+
+        smb.pop('secrets')
 
         return smb
 
@@ -324,12 +330,34 @@ class SMBService(SystemServiceService):
         """
         try:
             if section.upper() == 'GLOBAL':
-                return param.LoadParm(SMBPath.GLOBALCONF.platform()).get(parm, section)
+                try:
+                    LP_CTX.load(SMBPath.GLOBALCONF.platform())
+                except Exception as e:
+                    self.logger.warning("Failed to reload smb.conf: %s", e)
+
+                return LP_CTX.get(parm)
             else:
                 return self.middleware.call_sync('sharing.smb.reg_getparm', section, parm)
 
         except Exception as e:
             raise CallError(f'Attempt to query smb4.conf parameter [{parm}] failed with error: {e}')
+
+    @private
+    async def get_next_rid(self):
+        next_rid = (await self.config())['next_rid']
+        if next_rid == 0:
+            try:
+                private_dir = await self.middleware.call("smb.getparm", "private directory", "GLOBAL")
+                next_rid = passdb.PDB(f"tdbsam:{private_dir}/passdb.tdb").new_rid()
+            except Exception:
+                self.logger.warning("Failed to initialize RID counter from passdb. "
+                                    "Using default value for initialization.", exc_info=True)
+                next_rid = 5000
+
+        await self.middleware.call('datastore.update', 'services.cifs', 1,
+                                   {'next_rid': next_rid + 1},
+                                   {'prefix': 'cifs_srv_'})
+        return next_rid
 
     @private
     async def setup_directories(self):
@@ -359,25 +387,74 @@ class SMBService(SystemServiceService):
                 os.chmod(path, p.mode())
 
     @private
+    async def import_conf_to_registry(self):
+        drop = await run([SMBCmd.NET.value, 'conf', 'drop'], check=False)
+        if drop.returncode != 0:
+            self.logger.warning('failed to drop existing share config: %s',
+                                drop.stderr.decode())
+        load = await run([SMBCmd.NET.value, 'conf', 'import',
+                          SMBPath.SHARECONF.platform()], check=False)
+        if load.returncode != 0:
+            self.logger.warning('failed to load share config: %s',
+                                load.stderr.decode())
+
+    @private
     @job(lock="smb_configure")
     async def configure(self, job):
+        await self.reset_smb_ha_mode()
         job.set_progress(0, 'Preparing to configure SMB.')
         data = await self.config()
         job.set_progress(10, 'Generating SMB config.')
         await self.middleware.call('etc.generate', 'smb')
+
+        # Following hack will be removed once we make our own samba package
+        if osc.IS_LINUX:
+            os.remove("/etc/samba/smb.conf")
+            os.symlink("/etc/smb4.conf", "etc/samba/smb.conf")
+
+        """
+        Many samba-related tools will fail if they are unable to initialize
+        a messaging context, which will happen if the samba-related directories
+        do not exist or have incorrect permissions.
+        """
         job.set_progress(20, 'Setting up SMB directories.')
         await self.setup_directories()
         job.set_progress(30, 'Setting up server SID.')
         await self.middleware.call('smb.set_sid', data['cifs_SID'])
 
+        """
+        If the ldap passdb backend is being used, then the remote LDAP server
+        will provide the SMB users and groups. We skip these steps to avoid having
+        samba potentially try to write our local users and groups to the remote
+        LDAP server.
+        """
         if await self.middleware.call("smb.getparm", "passdb backend", "global") == "tdbsam":
-            job.set_progress(40, 'Synchronizing passdb.')
-            await self.middleware.call("smb.synchronize_passdb")
-            job.set_progress(50, 'Synchronizing group mappings.')
-            await self.middleware.call("smb.synchronize_group_mappings")
+            job.set_progress(40, 'Synchronizing passdb and groupmap.')
+            await self.middleware.call('etc.generate', 'user')
+            pdb_job = await self.middleware.call("smb.synchronize_passdb")
+            grp_job = await self.middleware.call("smb.synchronize_group_mappings")
+            await pdb_job.wait()
+            await grp_job.wait()
             await self.middleware.call("admonitor.start")
-            job.set_progress(60, 'generating SMB share configuration.')
-            await self.middleware.call("etc.generate", "smb_share")
+
+        """
+        The following steps ensure that we cleanly import our SMB shares
+        into the registry.
+        """
+        job.set_progress(60, 'generating SMB share configuration.')
+        await self.middleware.call('cache.put', 'SMB_REG_INITIALIZED', False)
+        await self.middleware.call("etc.generate", "smb_share")
+        await self.middleware.call("smb.import_conf_to_registry")
+        await self.middleware.call('cache.put', 'SMB_REG_INITIALIZED', True)
+        os.unlink(SMBPath.SHARECONF.platform())
+
+        """
+        It is possible that system dataset was migrated or an upgrade
+        wiped our secrets.tdb file. Re-import directory service secrets
+        if they are missing from the current running configuration.
+        """
+        job.set_progress(65, 'Initializing directory services')
+        await self.middleware.call("directoryservices.initialize")
 
         job.set_progress(70, 'Checking SMB server status.')
         if await self.middleware.call("service.started", "cifs"):
@@ -406,6 +483,67 @@ class SMBService(SystemServiceService):
     async def reset_smb_ha_mode(self):
         await self.middleware.call('cache.pop', 'SMB_HA_MODE')
         return await self.get_smb_ha_mode()
+
+    @private
+    async def validate_smb(self, new, verrors):
+        try:
+            await self.middleware.call('sharing.smb.validate_aux_params',
+                                       new['smb_options'],
+                                       'smb_update.smb_options')
+        except ValidationErrors as errs:
+            verrors.add_child('smb_update.smb_options', errs)
+
+        if new.get('unixcharset') and new['unixcharset'] not in await self.unixcharset_choices():
+            verrors.add(
+                'smb_update.unixcharset',
+                'Please provide a valid value for unixcharset'
+            )
+
+        for i in ('workgroup', 'netbiosname', 'netbiosname_b', 'netbiosalias'):
+            """
+            There are two cases where NetBIOS names must be rejected:
+            1. They contain invalid characters for NetBIOS protocol
+            2. The name is identical to the NetBIOS workgroup.
+            """
+            if not i:
+                continue
+
+            if i == 'netbiosalias':
+                for idx, item in enumerate(new[i]):
+                    if not await self.__validate_netbios_name(item):
+                        verrors.add(f'smb_update.{i}.{idx}', f'Invalid NetBIOS name: {item}')
+                    if item.casefold() == new['workgroup'].casefold():
+                        verrors.add(
+                            f'smb_update.{i}.{idx}',
+                            f'NetBIOS alias [{item}] conflicts with workgroup name.'
+                        )
+            else:
+                if not await self.__validate_netbios_name(new[i]):
+                    verrors.add(f'smb_update.{i}', f'Invalid NetBIOS name: {new[i]}')
+
+                if i != 'workgroup' and new[i].casefold() == new['workgroup'].casefold():
+                    verrors.add(
+                        f'smb_update.{i}',
+                        f'NetBIOS name [{new[i]}] conflicts with workgroup name.'
+                    )
+
+        if new['guest'] == 'root':
+            verrors.add('smb_update.guest', '"root" is not a permitted guest account')
+
+        if new.get('bindip'):
+            bindip_choices = list((await self.bindip_choices()).keys())
+            for idx, item in enumerate(new['bindip']):
+                if item not in bindip_choices:
+                    verrors.add(f'smb_update.bindip.{idx}', f'IP address [{item}] is not a configured address for this server')
+
+        for i in ('filemask', 'dirmask'):
+            if not new[i]:
+                continue
+            try:
+                if int(new[i], 8) & ~0o11777:
+                    raise ValueError('Not an octet')
+            except (ValueError, TypeError):
+                verrors.add(f'smb_update.{i}', 'Not a valid mask')
 
     @accepts(Dict(
         'smb_update',
@@ -456,47 +594,11 @@ class SMBService(SystemServiceService):
         new.update(data)
 
         verrors = ValidationErrors()
-
-        if data.get('unixcharset') and data['unixcharset'] not in await self.unixcharset_choices():
-            verrors.add(
-                'smb_update.unixcharset',
-                'Please provide a valid value for unixcharset'
-            )
-
-        for i in ('workgroup', 'netbiosname', 'netbiosname_b', 'netbiosalias'):
-            if i not in data or not data[i]:
-                continue
-            if i == 'netbiosalias':
-                for idx, item in enumerate(data[i]):
-                    if not await self.__validate_netbios_name(item):
-                        verrors.add(f'smb_update.{i}.{idx}', f'Invalid NetBIOS name: {item}')
-            else:
-                if not await self.__validate_netbios_name(data[i]):
-                    verrors.add(f'smb_update.{i}', f'Invalid NetBIOS name: {data[i]}')
-
-        if new['netbiosname'] and new['netbiosname'].lower() == new['workgroup'].lower():
-            verrors.add('smb_update.netbiosname', 'NetBIOS and Workgroup must be unique')
-
-        if data.get('bindip'):
-            bindip_choices = list((await self.bindip_choices()).keys())
-            for idx, item in enumerate(data['bindip']):
-                if item not in bindip_choices:
-                    verrors.add(f'smb_update.bindip.{idx}', f'IP address [{item}] is not a configured address for this server')
-
-        for i in ('filemask', 'dirmask'):
-            if i not in data or not data[i]:
-                continue
-            try:
-                if int(data[i], 8) & ~0o11777:
-                    raise ValueError('Not an octet')
-            except (ValueError, TypeError):
-                verrors.add(f'smb_update.{i}', 'Not a valid mask')
+        await self.validate_smb(new, verrors)
+        verrors.check()
 
         if new['admin_group'] and new['admin_group'] != old['admin_group']:
             await self.middleware.call('smb.add_admin_group', new['admin_group'])
-
-        if verrors:
-            raise verrors
 
         # TODO: consider using bidict
         for k, v in LOGLEVEL_MAP.items():
@@ -515,6 +617,7 @@ class SMBService(SystemServiceService):
     async def compress(self, data):
         data['netbiosalias'] = ' '.join(data['netbiosalias'])
         data.pop('netbiosname_local', None)
+        data.pop('next_rid')
         return data
 
 
@@ -524,7 +627,7 @@ class SharingSMBModel(sa.Model):
     id = sa.Column(sa.Integer(), primary_key=True)
     cifs_purpose = sa.Column(sa.String(120))
     cifs_path = sa.Column(sa.String(255), nullable=True)
-    cifs_path_suffix = sa.Column(sa.String(255), nullable=True)
+    cifs_path_suffix = sa.Column(sa.String(255), nullable=False)
     cifs_home = sa.Column(sa.Boolean(), default=False)
     cifs_name = sa.Column(sa.String(120))
     cifs_comment = sa.Column(sa.String(120))
@@ -548,12 +651,25 @@ class SharingSMBModel(sa.Model):
     cifs_share_acl = sa.Column(sa.Text())
 
 
-class SharingSMBService(CRUDService):
+class SharingSMBService(SharingService):
+
+    share_task_type = 'SMB'
+
     class Config:
         namespace = 'sharing.smb'
         datastore = 'sharing.cifs_share'
         datastore_prefix = 'cifs_'
         datastore_extend = 'sharing.smb.extend'
+
+    @private
+    async def strip_comments(self, data):
+        parsed_config = ""
+        for entry in data['auxsmbconf'].splitlines():
+            if entry == "" or entry.startswith(('#', ';')):
+                continue
+            parsed_config += entry if len(parsed_config) == 0 else f'\n{entry}'
+
+        data['auxsmbconf'] = parsed_config
 
     @accepts(Dict(
         'sharingsmb_create',
@@ -574,7 +690,8 @@ class SharingSMBService(CRUDService):
         Bool('aapl_name_mangling', default=False),
         Bool('acl', default=True),
         Bool('durablehandle', default=True),
-        Bool('shadowcopy', default=True),
+        # shadowcopy only available for FreeBSD (for now)
+        Bool('shadowcopy', default=osc.IS_FREEBSD),
         Bool('streams', default=True),
         Bool('fsrvp', default=False),
         Str('auxsmbconf', max_length=None, default=''),
@@ -616,8 +733,7 @@ class SharingSMBService(CRUDService):
         await self.clean(data, 'sharingsmb_create', verrors)
         await self.validate(data, 'sharingsmb_create', verrors)
 
-        if verrors:
-            raise verrors
+        verrors.check()
 
         if path and not os.path.exists(path):
             try:
@@ -633,9 +749,8 @@ class SharingSMBService(CRUDService):
             'datastore.insert', self._config.datastore, data,
             {'prefix': self._config.datastore_prefix})
 
+        await self.strip_comments(data)
         await self.middleware.call('sharing.smb.reg_addshare', data)
-        await self.extend(data)  # We should do this in the insert call ?
-
         enable_aapl = await self.check_aapl(data)
 
         if enable_aapl:
@@ -643,7 +758,7 @@ class SharingSMBService(CRUDService):
         else:
             await self._service_change('cifs', 'reload')
 
-        return data
+        return await self.get_instance(data['id'])
 
     @accepts(
         Int('id'),
@@ -688,37 +803,88 @@ class SharingSMBService(CRUDService):
         if old['purpose'] != new['purpose']:
             await self.apply_presets(new)
 
+        old_is_locked = (await self.get_instance(id))['locked']
+        if old['path'] != new['path']:
+            new_is_locked = await self.middleware.call('pool.dataset.path_in_locked_datasets', new['path'])
+        else:
+            new_is_locked = old_is_locked
+
         await self.compress(new)
         await self.middleware.call(
             'datastore.update', self._config.datastore, id, new,
             {'prefix': self._config.datastore_prefix})
 
-        enable_aapl = await self.check_aapl(new)
-        if newname != oldname:
-            # This is disruptive change. Share is actually being removed and replaced.
-            # Forcibly closes any existing SMB sessions.
-            await self.close_share(oldname)
+        await self.strip_comments(new)
+        if not new_is_locked:
+            """
+            Enabling AAPL SMB2 extensions globally affects SMB shares. If this
+            happens, the SMB service _must_ be restarted. Skip this step if dataset
+            underlying the new path is encrypted.
+            """
+            enable_aapl = await self.check_aapl(new)
+        else:
+            enable_aapl = False
+
+        """
+        OLD    NEW   = dataset path is encrypted
+         ----------
+         -      -    = pre-12 behavior. Remove and replace if name changed, else update.
+         -      X    = Delete share from running configuration
+         X      -    = Add share to running configuration
+         X      X    = no-op
+        """
+        if old_is_locked and new_is_locked:
+            """
+            Configuration change only impacts a locked SMB share. From standpoint of
+            running config, this is a no-op. No need to restart or reload service.
+            """
+            return await self.get_instance(id)
+
+        elif not old_is_locked and not new_is_locked:
+            """
+            Default behavior before changes for locked datasets.
+            """
+            if newname != oldname:
+                # This is disruptive change. Share is actually being removed and replaced.
+                # Forcibly closes any existing SMB sessions.
+                await self.close_share(oldname)
+                try:
+                    await self.middleware.call('sharing.smb.reg_delshare', oldname)
+                except Exception:
+                    self.logger.warning('Failed to remove stale share [%s]',
+                                        old['name'], exc_info=True)
+                await self.middleware.call('sharing.smb.reg_addshare', new)
+            else:
+                diff = await self.middleware.call(
+                    'sharing.smb.diff_middleware_and_registry', new['name'], new
+                )
+                if diff is None:
+                    await self.middleware.call('sharing.smb.reg_addshare', new)
+                else:
+                    share_name = new['name'] if not new['home'] else 'homes'
+                    await self.middleware.call('sharing.smb.apply_conf_diff',
+                                               'REGISTRY', share_name, diff)
+
+        elif old_is_locked and not new_is_locked:
+            """
+            Since the old share was not in our running configuration, we need
+            to add it.
+            """
+            await self.middleware.call('sharing.smb.reg_addshare', new)
+
+        elif not old_is_locked and new_is_locked:
             try:
                 await self.middleware.call('sharing.smb.reg_delshare', oldname)
             except Exception:
-                self.logger.warning('Failed to remove stale share [%s]',
+                self.logger.warning('Failed to remove locked share [%s]',
                                     old['name'], exc_info=True)
-            await self.middleware.call('sharing.smb.reg_addshare', new)
-        else:
-            diff = await self.middleware.call(
-                'sharing.smb.diff_middleware_and_registry', new['name'], new
-            )
-            await self.middleware.call('sharing.smb.apply_conf_diff',
-                                       'REGISTRY', new['name'], diff)
-
-        await self.extend(new)  # same here ?
 
         if enable_aapl:
             await self._service_change('cifs', 'restart')
         else:
             await self._service_change('cifs', 'reload')
 
-        return new
+        return await self.get_instance(id)
 
     @accepts(Int('id'))
     async def do_delete(self, id):
@@ -763,12 +929,36 @@ class SharingSMBService(CRUDService):
     async def close_share(self, share_name):
         c = await run([SMBCmd.SMBCONTROL.value, 'smbd', 'close-share', share_name], check=False)
         if c.returncode != 0:
+            if "Can't find pid" in c.stderr.decode():
+                # smbd is not running. Don't log error message.
+                return
+
             self.logger.warn('Failed to close smb share [%s]: [%s]',
                              share_name, c.stderr.decode().strip())
 
     @private
     async def clean(self, data, schema_name, verrors, id=None):
         data['name'] = await self.name_exists(data, schema_name, verrors, id)
+
+    @private
+    async def validate_aux_params(self, data, schema_name):
+        """
+        libsmbconf expects to be provided with key-value pairs.
+        """
+        verrors = ValidationErrors()
+        for entry in data.splitlines():
+            if entry == '' or entry.startswith(('#', ';')):
+                continue
+
+            kv = entry.split('=', 1)
+            if len(kv) != 2:
+                verrors.add(
+                    f'{schema_name}.auxsmbconf',
+                    f'Auxiliary parameters must be in the format of "key = value": {entry}'
+                )
+                continue
+
+        verrors.check()
 
     @private
     async def validate(self, data, schema_name, verrors, old=None):
@@ -782,9 +972,14 @@ class SharingSMBService(CRUDService):
             verrors.add(f'{schema_name}.path', 'This field is required.')
 
         if data['path']:
-            await check_path_resides_within_volume(
-                verrors, self.middleware, f"{schema_name}.path", data['path']
-            )
+            await self.validate_path_field(data, schema_name, verrors)
+
+        if data['auxsmbconf']:
+            try:
+                await self.validate_aux_params(data['auxsmbconf'],
+                                               f'{schema_name}.auxsmbconf')
+            except ValidationErrors as errs:
+                verrors.add_child(f'{schema_name}.auxsmbconf', errs)
 
         if not data['acl'] and not await self.middleware.call('filesystem.acl_is_trivial', data['path']):
             verrors.add(
@@ -798,6 +993,19 @@ class SharingSMBService(CRUDService):
                 f'{schema_name}.name',
                 f'{data["name"]} is a reserved section name, please select another one'
             )
+
+        if osc.IS_LINUX:
+            if data['shadowcopy']:
+                verrors.add(
+                    f'{schema_name}.shadowcopy',
+                    'ZFS shadow copy support is not yet implemented in TrueNAS scale'
+                )
+            if data['fsrvp']:
+                verrors.add(
+                    f'{schema_name}.fsrvp',
+                    'ZFS fsrvp support is not yet implemented in TrueNAS scale'
+                )
+
         if data.get('path_suffix') and len(data['path_suffix'].split('/')) > 2:
             verrors.add(f'{schema_name}.name',
                         'Path suffix may not contain more than two components.')
@@ -826,16 +1034,21 @@ class SharingSMBService(CRUDService):
         if direction == 'TO':
             ret = {}
             for entry in aux.splitlines():
-                try:
-                    kv = param.split('=', 1)
-                    ret[kv[0].strip()] = kv[1].strip()
-                except Exception:
-                    self.logger.debug("Share contains invalid auxiliary parameter: [%s]",
-                                      param)
+                if entry == '':
+                    continue
+
+                if entry.startswith(('#', ';')):
+                    # Special handling for comments
+                    ret[entry] = None
+                    continue
+
+                kv = entry.split('=', 1)
+                ret[kv[0].strip()] = kv[1].strip()
+
             return ret
 
         if direction == 'FROM':
-            return '\n'.join([f'{k}={v}' for k, v in aux.items()])
+            return '\n'.join([f'{k}={v}' if v is not None else k for k, v in aux.items()])
 
     @private
     async def name_exists(self, data, schema_name, verrors, id=None):
@@ -877,6 +1090,7 @@ class SharingSMBService(CRUDService):
     async def compress(self, data):
         data['hostsallow'] = ' '.join(data['hostsallow'])
         data['hostsdeny'] = ' '.join(data['hostsdeny'])
+        data.pop(self.locked_field, None)
 
         return data
 
@@ -920,11 +1134,64 @@ class SharingSMBService(CRUDService):
         """
         return {x.name: x.value for x in SMBSharePreset}
 
+    @private
+    async def sync_registry(self):
+        """
+        Synchronize registry config with the share configuration in the truenas config
+        file. This method simply reconciles lists of shares, removing from and adding to
+        the registry as-needed.
+        """
+        if not os.path.exists(SMBPath.GLOBALCONF.platform()):
+            self.logger.warning("smb.conf does not exist. Skipping registry synchronization."
+                                "This may indicate that SMB service has not completed initialization.")
+            return
+
+        active_shares = await self.query([('locked', '=', False), ('enabled', '=', True)])
+        for share in active_shares:
+            if share['home']:
+                share['name'] = 'homes'
+
+        registry_shares = await self.middleware.call('sharing.smb.reg_listshares')
+        cf_active = set([x['name'].casefold() for x in active_shares])
+        cf_reg = set([x.casefold() for x in registry_shares])
+        to_add = cf_active - cf_reg
+        to_del = cf_reg - cf_active
+
+        for share in to_add:
+            share_conf = list(filter(lambda x: x['name'].casefold() == share.casefold(), active_shares))
+            if not os.path.exists(share_conf[0]['path']):
+                self.logger.warning("Path [%s] for share [%s] does not exist. "
+                                    "Refusing to add share to SMB configuration.",
+                                    share_conf[0]['path'], share_conf[0]['name'])
+                continue
+
+            try:
+                await self.middleware.call('sharing.smb.reg_addshare', share_conf[0])
+            except Exception:
+                self.logger.warning("Failed to add SMB share [%] while synchronizing registry config",
+                                    share, exc_info=True)
+
+        for share in to_del:
+            await self.middleware.call('sharing.smb.close_share', share)
+            try:
+                await self.middleware.call('sharing.smb.reg_delshare', share)
+            except Exception:
+                self.middleware.logger.warning('Failed to remove stale share [%s]',
+                                               share, exc_info=True)
+
 
 async def pool_post_import(middleware, pool):
     """
     Makes sure to reload SMB if a pool is imported and there are shares configured for it.
     """
+    if pool is None:
+        """
+        By the time the post-import hook is called, the smb.configure should have
+        already completed and initialized the SMB service.
+        """
+        asyncio.ensure_future(middleware.call('sharing.smb.sync_registry'))
+        return
+
     path = f'/mnt/{pool["name"]}'
     if await middleware.call('sharing.smb.query', [
         ('OR', [
@@ -932,41 +1199,21 @@ async def pool_post_import(middleware, pool):
             ('path', '^', f'{path}/'),
         ])
     ]):
-        asyncio.ensure_future(middleware.call('service.reload', 'cifs'))
+        asyncio.ensure_future(middleware.call('sharing.smb.sync_registry'))
 
 
-class SMBFSAttachmentDelegate(FSAttachmentDelegate):
+class SMBFSAttachmentDelegate(LockableFSAttachmentDelegate):
     name = 'smb'
     title = 'SMB Share'
     service = 'cifs'
+    service_class = SharingSMBService
 
-    async def query(self, path, enabled):
-        results = []
-        for smb in await self.middleware.call('sharing.smb.query', [['enabled', '=', enabled]]):
-            if is_child(smb['path'], path):
-                results.append(smb)
-
-        return results
-
-    async def get_attachment_name(self, attachment):
-        return attachment['name']
-
-    async def delete(self, attachments):
-        for attachment in attachments:
-            await self.middleware.call('datastore.delete', 'sharing.cifs_share', attachment['id'])
-
-        await self._service_change('cifs', 'reload')
-
-    async def toggle(self, attachments, enabled):
-        for attachment in attachments:
-            await self.middleware.call('datastore.update', 'sharing.cifs_share', attachment['id'],
-                                       {'cifs_enabled': enabled})
-
-        await self._service_change('cifs', 'reload')
-
-        if not enabled:
-            for attachment in attachments:
-                await run([SMBCmd.SMBCONTROL.value, 'smbd', 'close-share', attachment['name']], check=False)
+    async def restart_reload_services(self, attachments):
+        """
+        libsmbconf will handle any required notifications to clients if
+        shares are added or deleted.
+        """
+        await self.middleware.call('sharing.smb.sync_registry')
 
 
 async def setup(middleware):

@@ -25,7 +25,7 @@ class DiskService(Service):
             raise CallError(f'Failed to wipe disk {disk}: {job.error}')
 
         # Calculate swap size.
-        swapsize = swapgb * 1024 * 1024 * 2
+        swapsize = swapgb * 1024 * 1024 * 1024 / (disk_details["sectorsize"] or 512)
         # Round up to nearest whole integral multiple of 128
         # so next partition starts at mutiple of 128.
         swapsize = (int((swapsize + 127) / 128)) * 128
@@ -65,6 +65,9 @@ class DiskService(Service):
             )
             if cp.returncode != 0:
                 raise CallError(f'Unable to GPT format the disk "{disk}": {cp.stderr}')
+
+        if osc.IS_LINUX:
+            self.middleware.call_sync('device.settle_udev_events')
 
         if sync:
             # We might need to sync with reality (e.g. devname -> uuid)

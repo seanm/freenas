@@ -42,7 +42,6 @@ class ReplicationModel(sa.Model):
     repl_retention_policy = sa.Column(sa.String(120), default="NONE")
     repl_lifetime_unit = sa.Column(sa.String(120), nullable=True, default='WEEK')
     repl_lifetime_value = sa.Column(sa.Integer(), nullable=True, default=2)
-    repl_dedup = sa.Column(sa.Boolean(), default=False)
     repl_large_block = sa.Column(sa.Boolean(), default=True)
     repl_embed = sa.Column(sa.Boolean(), default=False)
     repl_compressed = sa.Column(sa.Boolean(), default=True)
@@ -70,8 +69,8 @@ class ReplicationPeriodicSnapshotTaskModel(sa.Model):
     __tablename__ = 'storage_replication_repl_periodic_snapshot_tasks'
 
     id = sa.Column(sa.Integer(), primary_key=True)
-    replication_id = sa.Column(sa.ForeignKey('storage_replication.id'))
-    task_id = sa.Column(sa.ForeignKey('storage_task.id'))
+    replication_id = sa.Column(sa.ForeignKey('storage_replication.id', ondelete='CASCADE'), index=True)
+    task_id = sa.Column(sa.ForeignKey('storage_task.id', ondelete='CASCADE'), index=True)
 
 
 class ReplicationService(CRUDService):
@@ -179,7 +178,6 @@ class ReplicationService(CRUDService):
             Str("lifetime_unit", null=True, default=None, enum=["HOUR", "DAY", "WEEK", "MONTH", "YEAR"]),
             Str("compression", enum=["LZ4", "PIGZ", "PLZIP"], null=True, default=None),
             Int("speed_limit", null=True, default=None, validators=[Range(min=1)]),
-            Bool("dedup", default=False),
             Bool("large_block", default=True),
             Bool("embed", default=False),
             Bool("compressed", default=True),
@@ -236,7 +234,7 @@ class ReplicationService(CRUDService):
           * `NONE` does not delete any snapshots
         * `compression` compresses SSH stream. Available only for SSH transport
         * `speed_limit` limits speed of SSH stream. Available only for SSH transport
-        * `dedup`, `large_block`, `embed` and `compressed` are various ZFS stream flag documented in `man zfs send`
+        * `large_block`, `embed` and `compressed` are various ZFS stream flag documented in `man zfs send`
         * `retries` specifies number of retries before considering replication failed
 
         .. examples(websocket)::
@@ -291,7 +289,6 @@ class ReplicationService(CRUDService):
 
         await self._set_periodic_snapshot_tasks(id, periodic_snapshot_tasks)
 
-        await self.middleware.call("service.restart", "cron")
         await self.middleware.call("zettarepl.update_tasks")
 
         return await self._get_instance(id)
@@ -374,7 +371,6 @@ class ReplicationService(CRUDService):
 
         await self._set_periodic_snapshot_tasks(id, periodic_snapshot_tasks)
 
-        await self.middleware.call("service.restart", "cron")
         await self.middleware.call("zettarepl.update_tasks")
 
         return await self._get_instance(id)
@@ -405,7 +401,6 @@ class ReplicationService(CRUDService):
             id
         )
 
-        await self.middleware.call("service.restart", "cron")
         await self.middleware.call("zettarepl.update_tasks")
 
         return response
@@ -533,7 +528,7 @@ class ReplicationService(CRUDService):
                 if is_child(source_dataset, snapshot_task["dataset"]):
                     if data["recursive"]:
                         for exclude in snapshot_task["exclude"]:
-                            if exclude not in data["exclude"]:
+                            if is_child(exclude, source_dataset) and exclude not in data["exclude"]:
                                 verrors.add("exclude", f"You should exclude {exclude!r} as bound periodic snapshot "
                                                        f"task dataset {snapshot_task['dataset']!r} does")
                     else:
@@ -775,7 +770,7 @@ class ReplicationFSAttachmentDelegate(FSAttachmentDelegate):
     name = 'replication'
     title = 'Replication'
 
-    async def query(self, path, enabled):
+    async def query(self, path, enabled, options=None):
         results = []
         for replication in await self.middleware.call('replication.query', [['enabled', '=', enabled]]):
             if replication['direction'] == 'PUSH':
@@ -789,14 +784,10 @@ class ReplicationFSAttachmentDelegate(FSAttachmentDelegate):
 
         return results
 
-    async def get_attachment_name(self, attachment):
-        return attachment['name']
-
     async def delete(self, attachments):
         for attachment in attachments:
             await self.middleware.call('datastore.delete', 'storage.replication', attachment['id'])
 
-        await self.middleware.call('service.restart', 'cron')
         await self.middleware.call('zettarepl.update_tasks')
 
     async def toggle(self, attachments, enabled):
@@ -804,7 +795,6 @@ class ReplicationFSAttachmentDelegate(FSAttachmentDelegate):
             await self.middleware.call('datastore.update', 'storage.replication', attachment['id'],
                                        {'repl_enabled': enabled})
 
-        await self.middleware.call('service.restart', 'cron')
         await self.middleware.call('zettarepl.update_tasks')
 
 

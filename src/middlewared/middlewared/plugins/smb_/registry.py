@@ -2,8 +2,22 @@ from middlewared.service import private, Service
 from middlewared.service_exception import CallError
 from middlewared.utils import run
 from middlewared.plugins.smb import SMBCmd, SMBSharePreset
+from middlewared.utils import osc
 
 import errno
+
+FRUIT_CATIA_MAPS = [
+    "0x01:0xf001,0x02:0xf002,0x03:0xf003,0x04:0xf004",
+    "0x05:0xf005,0x06:0xf006,0x07:0xf007,0x08:0xf008",
+    "0x09:0xf009,0x0a:0xf00a,0x0b:0xf00b,0x0c:0xf00c",
+    "0x0d:0xf00d,0x0e:0xf00e,0x0f:0xf00f,0x10:0xf010",
+    "0x11:0xf011,0x12:0xf012,0x13:0xf013,0x14:0xf014",
+    "0x15:0xf015,0x16:0xf016,0x17:0xf017,0x18:0xf018",
+    "0x19:0xf019,0x1a:0xf01a,0x1b:0xf01b,0x1c:0xf01c",
+    "0x1d:0xf01d,0x1e:0xf01e,0x1f:0xf01f",
+    "0x22:0xf020,0x2a:0xf021,0x3a:0xf022,0x3c:0xf023",
+    "0x3e:0xf024,0x3f:0xf025,0x5c:0xf026,0x7c:0xf027"
+]
 
 
 class SharingSMBService(Service):
@@ -41,9 +55,11 @@ class SharingSMBService(Service):
 
         netconf = await run(cmd, check=False)
         if netconf.returncode != 0:
-            self.logger.debug('netconf failure stdout: %s', netconf.stdout.decode())
+            if action != 'getparm':
+                self.logger.debug('netconf failure for command [%s] stdout: %s',
+                                  cmd, netconf.stdout.decode())
             raise CallError(
-                f'net conf {action} failed with error: {netconf.stderr.decode()}'
+                f'net conf {action} [{share}] failed with error: {netconf.stderr.decode()}'
             )
 
         return netconf.stdout.decode()
@@ -126,6 +142,9 @@ class SharingSMBService(Service):
             gl['nfs_exports'] = await self.middleware.call('sharing.nfs.query', [['enabled', '=', True]])
         if gl['smb_shares'] is None:
             gl['smb_shares'] = await self.middleware.call('sharing.smb.query', [['enabled', '=', True]])
+            for share in gl['smb_shares']:
+                await self.middleware.call('sharing.smb.strip_comments', share)
+
         if gl['ad_enabled'] is None:
             gl['ad_enabled'] = False if (await self.middleware.call('activedirectory.get_state')) == "DISABLED" else True
 
@@ -167,8 +186,13 @@ class SharingSMBService(Service):
         if data is None:
             data = await self.middleware.call('sharing.smb.query', [('name', '=', share)], {'get': True})
 
+        await self.middleware.call('sharing.smb.strip_comments', data)
         share_conf = await self.share_to_smbconf(data)
-        reg_conf = await self.reg_showshare(share)
+        try:
+            reg_conf = await self.reg_showshare(share if not data['home'] else 'homes')
+        except Exception:
+            return None
+
         s_keys = set(share_conf.keys())
         r_keys = set(reg_conf.keys())
         intersect = s_keys.intersection(r_keys)
@@ -206,15 +230,20 @@ class SharingSMBService(Service):
     async def share_to_smbconf(self, conf_in, globalconf=None):
         data = conf_in.copy()
         gl = await self.get_global_params(globalconf)
+        await self.middleware.call('sharing.smb.strip_comments', data)
         conf = {}
 
         if data['home'] and gl['ad_enabled']:
-            data['path_suffix'] = '%d/%U'
+            data['path_suffix'] = '%D/%U'
         elif data['home']:
             data['path_suffix'] = '%U'
 
         conf['path'] = '/'.join([data['path'], data['path_suffix']]) if data['path_suffix'] else data['path']
-        data['vfsobjects'] = ['aio_fbsd']
+        if osc.IS_FREEBSD:
+            data['vfsobjects'] = ['aio_fbsd']
+        else:
+            data['vfsobjects'] = []
+
         if data['comment']:
             conf["comment"] = data['comment']
         if not data['browsable']:
@@ -251,7 +280,10 @@ class SharingSMBService(Service):
             data['vfsobjects'].append('fruit')
 
         if data['acl']:
-            data['vfsobjects'].append('ixnas')
+            if osc.IS_FREEBSD:
+                data['vfsobjects'].append('ixnas')
+            else:
+                data['vfsobjects'].append('acl_xattr')
         else:
             data['vfsobjects'].append('noacl')
 
@@ -262,7 +294,8 @@ class SharingSMBService(Service):
             data['vfsobjects'].extend(['recycle', 'crossrename'])
 
         if data['shadowcopy'] or data['fsrvp']:
-            data['vfsobjects'].append('shadow_copy_zfs')
+            if osc.IS_FREEBSD:
+                data['vfsobjects'].append('shadow_copy_zfs')
 
         if data['durablehandle']:
             conf.update({
@@ -271,7 +304,7 @@ class SharingSMBService(Service):
                 "posix locking": "no",
             })
 
-        if data['fsrvp']:
+        if data['fsrvp'] and osc.IS_FREEBSD:
             data['vfsobjects'].append('zfs_fsrvp')
             conf.update({
                 "shadow:ignore_empty_snaps": "false",
@@ -285,13 +318,16 @@ class SharingSMBService(Service):
 
         if data['aapl_name_mangling']:
             data['vfsobjects'].append('catia')
-            conf.update({
-                'fruit:encoding': 'native',
-                'mangled names': 'no'
-            })
-
-        if data['timemachine']:
-            conf["fruit:time machine"] = "yes"
+            if gl['fruit_enabled']:
+                conf.update({
+                    'fruit:encoding': 'native',
+                    'mangled names': 'no'
+                })
+            else:
+                conf.update({
+                    'catia:mappings': ','.join(FRUIT_CATIA_MAPS),
+                    'mangled names': 'no'
+                })
 
         if data['purpose'] == 'ENHANCED_TIMEMACHINE':
             data['vfsobjects'].append('tmprotect')
@@ -316,13 +352,17 @@ class SharingSMBService(Service):
                 "streams_xattr:store_stream_type": "no"
             })
 
+        if data['timemachine']:
+            conf["fruit:time machine"] = "yes"
+            conf["fruit:locking"] = "none"
+
         nfs_path_list = []
 
         if data['recyclebin']:
             conf.update({
                 "recycle:repository": ".recycle/%D/%U" if gl['ad_enabled'] else ".recycle/%U",
                 "recycle:keeptree": "yes",
-                "recycle:keepversions": "yes",
+                "recycle:versions": "yes",
                 "recycle:touch": "yes",
                 "recycle:directory_mode": "0777",
                 "recycle:subdir_mode": "0700"

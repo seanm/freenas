@@ -9,6 +9,8 @@ class NFSService(SimpleService):
 
     freebsd_rc = "nfsd"
 
+    systemd_unit = "nfs-ganesha"
+
     async def _start_freebsd(self):
         await self._freebsd_service("rpcbind", "start")
         await self.middleware.call("nfs.setup_v4")
@@ -29,3 +31,7 @@ class NFSService(SimpleService):
     async def _reload_freebsd(self):
         await self.middleware.call("nfs.setup_v4")
         await self._freebsd_service("mountd", "reload", force=True)
+
+    async def _stop_linux(self):
+        await self._systemd_unit("nfs-ganesha-lock", "stop")
+        await super()._stop_linux()

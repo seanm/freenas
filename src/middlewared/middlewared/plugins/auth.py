@@ -174,6 +174,10 @@ class LoginPasswordSessionManagerCredentials(SessionManagerCredentials):
     pass
 
 
+class ApiKeySessionManagerCredentials(SessionManagerCredentials):
+    pass
+
+
 class TokenSessionManagerCredentials(SessionManagerCredentials):
     def __init__(self, token_manager, token):
         self.token_manager = token_manager
@@ -327,6 +331,19 @@ class AuthService(Service):
             self.session_manager.login(app, LoginPasswordSessionManagerCredentials())
         return valid
 
+    @no_auth_required
+    @accepts(Str('api_key'))
+    @pass_app()
+    async def login_with_api_key(self, app, api_key):
+        """
+        Authenticate session using API Key.
+        """
+        if await self.middleware.call('api_key.authenticate', api_key):
+            self.session_manager.login(app, ApiKeySessionManagerCredentials())
+            return True
+
+        return False
+
     @accepts()
     @pass_app()
     async def logout(self, app):
@@ -355,7 +372,7 @@ class TwoFactorAuthModel(sa.Model):
 
     id = sa.Column(sa.Integer(), primary_key=True)
     otp_digits = sa.Column(sa.Integer(), default=6)
-    secret = sa.Column(sa.String(16), nullable=True, default=None)
+    secret = sa.Column(sa.EncryptedText(), nullable=True, default=None)
     window = sa.Column(sa.Integer(), default=0)
     interval = sa.Column(sa.Integer(), default=30)
     services = sa.Column(sa.JSON(), default={})
@@ -371,8 +388,6 @@ class TwoFactorAuthService(ConfigService):
 
     @private
     async def two_factor_extend(self, data):
-        data['secret'] = await self.middleware.call('pwenc.decrypt', data['secret'])
-
         for srv in ['ssh']:
             data['services'].setdefault(srv, False)
 
@@ -411,8 +426,6 @@ class TwoFactorAuthService(ConfigService):
             config['secret'] = await self.middleware.run_in_thread(
                 self.generate_base32_secret
             )
-
-        config['secret'] = await self.middleware.call('pwenc.encrypt', config['secret'])
 
         await self.middleware.call(
             'datastore.update',
@@ -454,7 +467,7 @@ class TwoFactorAuthService(ConfigService):
             'datastore.update',
             self._config.datastore,
             config['id'], {
-                'secret': self.middleware.call_sync('pwenc.encrypt', self.generate_base32_secret())
+                'secret': self.generate_base32_secret()
             }
         )
 

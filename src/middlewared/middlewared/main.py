@@ -5,6 +5,7 @@ from .job import Job, JobsQueue
 from .pipe import Pipes, Pipe
 from .restful import RESTfulAPI
 from .schema import Error as SchemaError
+import middlewared.service
 from .service_exception import adapt_exception, CallError, CallException, ValidationError, ValidationErrors
 from .utils import osc, start_daemon_thread, sw_version, LoadPluginsMixin
 from .utils.debug import get_frame_details, get_threads_stacks
@@ -12,6 +13,7 @@ from .utils.lock import SoftHardSemaphore, SoftHardSemaphoreLimit
 from .utils.io_thread_pool_executor import IoThreadPoolExecutor
 from .utils.profile import profile_wrap
 from .utils.run_in_thread import RunInThreadMixin
+from .utils.service.call import ServiceCallMixin
 from .webui_auth import WebUIAuth
 from .worker import main_worker, worker_init
 from aiohttp import web
@@ -37,7 +39,6 @@ import os
 import pickle
 import re
 import queue
-import select
 import setproctitle
 import signal
 import struct
@@ -308,6 +309,11 @@ class Application(object):
             return
 
         if message['msg'] == 'method':
+            if 'method' not in message:
+                self.send_error(message, errno.EINVAL,
+                                "Message is malformed: 'method' is absent.")
+                return
+
             try:
                 serviceobj, methodobj = self.middleware._method_lookup(message['method'])
             except CallError as e:
@@ -450,6 +456,11 @@ class FileApplication(object):
 
                 if token:
                     denied = False
+            elif auth.startswith('Bearer '):
+                key = auth.split(' ', 1)[1]
+
+                if await self.middleware.call('api_key.authenticate', key):
+                    denied = False
         else:
             qs = urllib.parse.parse_qs(request.query_string)
             if 'auth_token' in qs:
@@ -539,14 +550,29 @@ class ShellWorkerThread(threading.Thread):
     and spawning the reader and writer threads.
     """
 
-    def __init__(self, ws, input_queue, loop, jail=None):
+    def __init__(self, ws, input_queue, loop, options):
         self.ws = ws
         self.input_queue = input_queue
         self.loop = loop
         self.shell_pid = None
-        self.jail = jail
+        self.command = self.get_command(options)
         self._die = False
         super(ShellWorkerThread, self).__init__(daemon=True)
+
+    def get_command(self, options):
+        allowed_options = ('jail', 'vm_id')
+        if all(options.get(k) for k in allowed_options):
+            raise CallError(f'Only one option is supported from {", ".join(allowed_options)}')
+
+        if options.get('jail'):
+            return ['/usr/local/bin/iocage', 'console', '-f', options['jail']]
+        elif options.get('vm_id'):
+            if osc.IS_FREEBSD:
+                return ['/usr/bin/cu', '-l', f'nmdm{options["vm_id"]}B']
+            else:
+                return ['/usr/bin/virsh', 'console', f'{options["vm_data"]["id"]}_{options["vm_data"]["name"]}']
+        else:
+            return ['/usr/bin/login', '-p', '-f', 'root']
 
     def resize(self, cols, rows):
         self.input_queue.put(ShellResize(cols, rows))
@@ -558,18 +584,7 @@ class ShellWorkerThread(threading.Thread):
             osc.close_fds(3)
 
             os.chdir('/root')
-            cmd = [
-                '/usr/bin/login', '-p', '-f', 'root',
-            ]
-
-            if self.jail is not None:
-                cmd = [
-                    '/usr/local/bin/iocage',
-                    'console',
-                    '-f',
-                    self.jail
-                ]
-            os.execve(cmd[0], cmd, {
+            os.execve(self.command[0], self.command, {
                 'TERM': 'xterm',
                 'HOME': '/root',
                 'LANG': 'en_US.UTF-8',
@@ -587,7 +602,10 @@ class ShellWorkerThread(threading.Thread):
             and forwarding it to the websocket.
             """
             while True:
-                read = os.read(master_fd, 1024)
+                try:
+                    read = os.read(master_fd, 1024)
+                except OSError:
+                    break
                 if read == b'':
                     break
                 asyncio.run_coroutine_threadsafe(
@@ -708,8 +726,13 @@ class ShellApplication(object):
                     'id': conndata.id,
                 })
 
-                jail = data.get('jail')
-                conndata.t_worker = ShellWorkerThread(ws=ws, input_queue=input_queue, loop=asyncio.get_event_loop(), jail=jail)
+                options = data.get('options', {})
+                options['jail'] = data.get('jail') or options.get('jail')
+                if options.get('vm_id'):
+                    options['vm_data'] = await self.middleware.call('vm.get_instance', options['vm_id'])
+                conndata.t_worker = ShellWorkerThread(
+                    ws=ws, input_queue=input_queue, loop=asyncio.get_event_loop(), options=options
+                )
                 conndata.t_worker.start()
 
                 self.shells[conndata.id] = conndata.t_worker
@@ -728,22 +751,18 @@ class ShellApplication(object):
         if t_worker.shell_pid:
 
             try:
-                kqueue = select.kqueue()
-                kevent = select.kevent(t_worker.shell_pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ENABLE, select.KQ_NOTE_EXIT)
-                kqueue.control([kevent], 0)
+                pid_waiter = osc.PidWaiter(self.middleware, t_worker.shell_pid)
 
                 os.kill(t_worker.shell_pid, signal.SIGTERM)
 
                 # If process has not died in 2 seconds, try the big gun
-                events = await self.middleware.run_in_thread(kqueue.control, None, 1, 2)
-                if not events:
+                if not await pid_waiter.wait(2):
                     os.kill(t_worker.shell_pid, signal.SIGKILL)
 
                     # If process has not died even with the big gun
                     # There is nothing else we can do, leave it be and
                     # release the worker thread
-                    events = await self.middleware.run_in_thread(kqueue.control, None, 1, 2)
-                    if not events:
+                    if not await pid_waiter.wait(2):
                         t_worker.die()
             except ProcessLookupError:
                 pass
@@ -753,7 +772,14 @@ class ShellApplication(object):
         await self.middleware.run_in_thread(t_worker.join)
 
 
-class Middleware(LoadPluginsMixin, RunInThreadMixin):
+class PreparedCall:
+    def __init__(self, args=None, executor=None, job=None):
+        self.args = args
+        self.executor = executor
+        self.job = job
+
+
+class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
 
     CONSOLE_ONCE_PATH = '/tmp/.middlewared-console-once'
 
@@ -802,6 +828,7 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
         from middlewared.service import CoreService
         self.add_service(CoreService(self))
         self.event_register('core.environ', 'Send on middleware process environment changes.', private=True)
+        self.event_register('core.reconfigure_logging', 'Send when /var/log is remounted.', private=True)
 
     async def __plugins_load(self):
 
@@ -821,7 +848,7 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
             setup_funcs.append((setup_plugin, mod.setup))
 
         def on_modules_loaded():
-            self._console_write(f'resolving plugins schemas')
+            self._console_write('resolving plugins schemas')
 
         self._load_plugins(
             on_module_begin=on_module_begin,
@@ -843,6 +870,9 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
                 'auth',
                 # We need to register all services because pseudo-services can still be used by plugins setup functions
                 'service',
+                # We need to run pwenc first to ensure we have secret setup to work for encrypted fields which
+                # might be used in the setup functions.
+                'pwenc',
                 # We run boot plugin first to ensure we are able to retrieve
                 # BOOT POOL during system plugin initialization
                 'boot',
@@ -902,7 +932,7 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
     async def __periodic_task_wrapper(self, method, service_name, service_obj, method_name, interval):
         self.logger.trace("Calling periodic task %s", method_name)
         try:
-            await self._call(method_name, service_obj, method)
+            await self._call(method_name, service_obj, method, [])
         except Exception:
             self.logger.warning("Exception while calling periodic task", exc_info=True)
 
@@ -1111,9 +1141,9 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
     def pipe(self):
         return Pipe(self)
 
-    async def _call(
-        self, name, serviceobj, methodobj, params=None, app=None, pipes=None,
-        job_on_progress_cb=None, io_thread=True,
+    def _call_prepare(
+        self, name, serviceobj, methodobj, params, app=None, io_thread=True, job_on_progress_cb=None, pipes=None,
+        threadsafe=False,
     ):
         args = []
         if hasattr(methodobj, '_pass_app'):
@@ -1126,58 +1156,56 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
         # entry to keep track of its state.
         job_options = getattr(methodobj, '_job', None)
         if job_options:
-            # Currently its only a boolean
-            if serviceobj._config.process_pool is True:
+            if serviceobj._config.process_pool:
                 job_options['process'] = True
             # Create a job instance with required args
-            job = Job(
-                self, name, serviceobj, methodobj, args, job_options, pipes,
-                on_progress_cb=job_on_progress_cb,
-            )
+            job = Job(self, name, serviceobj, methodobj, args, job_options, pipes, job_on_progress_cb)
             # Add the job to the queue.
             # At this point an `id` is assinged to the job.
-            job = self.jobs.add(job)
-        else:
-            job = None
-
-        if job:
-            return job
-        else:
-
-            # Currently its only a boolean
-            if serviceobj._config.process_pool is True:
-                return await self._call_worker(name, *args)
-
-            if asyncio.iscoroutinefunction(methodobj):
-                return await methodobj(*args)
-
-            tpool = None
-            if serviceobj._config.thread_pool:
-                tpool = serviceobj._config.thread_pool
-            if hasattr(methodobj, '_thread_pool'):
-                tpool = methodobj._thread_pool
-            if tpool:
-                return await self.run_in_executor(tpool, methodobj, *args)
-
-            if io_thread:
-                run_method = self.run_in_thread
+            if not threadsafe:
+                self.jobs.add(job)
             else:
-                run_method = self._run_in_conn_threadpool
-            return await run_method(methodobj, *args)
+                event = threading.Event()
+                self.loop.call_soon_threadsafe(lambda: (self.jobs.add(job), event.set()))
+                event.wait()
+            return PreparedCall(job=job)
+
+        if hasattr(methodobj, '_thread_pool'):
+            executor = methodobj._thread_pool
+        elif serviceobj._config.thread_pool:
+            executor = serviceobj._config.thread_pool
+        elif io_thread:
+            executor = self.run_in_thread_executor
+        else:
+            executor = self.__ws_threadpool
+
+        return PreparedCall(args=args, executor=executor)
+
+    async def _call(
+        self, name, serviceobj, methodobj, params, **kwargs,
+    ):
+        prepared_call = self._call_prepare(name, serviceobj, methodobj, params, **kwargs)
+
+        if prepared_call.job:
+            return prepared_call.job
+
+        if asyncio.iscoroutinefunction(methodobj):
+            self.logger.trace('Calling %r in current IO loop', name)
+            return await methodobj(*prepared_call.args)
+
+        if serviceobj._config.process_pool:
+            self.logger.trace('Calling %r in process pool', name)
+            if isinstance(serviceobj, middlewared.service.CRUDService):
+                service_name, method_name = name.rsplit('.', 1)
+                if method_name in ['create', 'update', 'delete']:
+                    name = f'{service_name}.do_{method_name}'
+            return await self._call_worker(name, *prepared_call.args)
+
+        self.logger.trace('Calling %r in executor %r', name, prepared_call.executor)
+        return await self.run_in_executor(prepared_call.executor, methodobj, *prepared_call.args)
 
     async def _call_worker(self, name, *args, job=None):
         return await self.run_in_proc(main_worker, name, args, job)
-
-    def _method_lookup(self, name):
-        if '.' not in name:
-            raise CallError('Invalid method name', errno.EBADMSG)
-        try:
-            service, method_name = name.rsplit('.', 1)
-            serviceobj = self.get_service(service)
-            methodobj = getattr(serviceobj, method_name)
-        except (AttributeError, KeyError):
-            raise CallError(f'Method "{method_name}" not found in "{service}"', CallError.ENOMETHOD)
-        return serviceobj, methodobj
 
     def dump_args(self, args, method=None, method_name=None):
         if method is None:
@@ -1186,6 +1214,13 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
                     method = self._method_lookup(method_name)[1]
                 except Exception:
                     return args
+
+        if (not hasattr(method, 'accepts') and
+                method.__name__ in ['create', 'update', 'delete'] and
+                hasattr(method, '__self__')):
+            child_method = getattr(method.__self__, f'do_{method.__name__}', None)
+            if child_method is not None:
+                method = child_method
 
         if not hasattr(method, 'accepts'):
             return args
@@ -1197,28 +1232,43 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
 
         if profile:
             methodobj = profile_wrap(methodobj)
+
         return await self._call(
             name, serviceobj, methodobj, params,
-            app=app, pipes=pipes, job_on_progress_cb=job_on_progress_cb, io_thread=True,
+            app=app, io_thread=True, job_on_progress_cb=job_on_progress_cb, pipes=pipes,
         )
 
-    def call_sync(self, name, *params, job_on_progress_cb=None, wait=True):
-        """
-        Synchronous method call to be used from another thread.
-        """
-
+    def call_sync(self, name, *params, job_on_progress_cb=None):
         serviceobj, methodobj = self._method_lookup(name)
-        # This method is already being called from a thread so we cant use the same
-        # thread pool or we may get in a deadlock situation if all threads in the default
-        # pool are waiting.
-        # Instead we launch a new thread just for that call (io_thread).
-        return self.run_coroutine(
-            self._call(
-                name, serviceobj, methodobj, params,
-                io_thread=True, job_on_progress_cb=job_on_progress_cb,
-            ),
-            wait=wait,
-        )
+
+        prepared_call = self._call_prepare(name, serviceobj, methodobj, params, job_on_progress_cb=job_on_progress_cb,
+                                           threadsafe=True)
+
+        if prepared_call.job:
+            return prepared_call.job
+
+        if asyncio.iscoroutinefunction(methodobj):
+            self.logger.trace('Calling %r in main IO loop', name)
+            return self.run_coroutine(methodobj(*prepared_call.args))
+
+        if serviceobj._config.process_pool:
+            self.logger.trace('Calling %r in process pool', name)
+            return self.run_coroutine(self._call_worker(name, *prepared_call.args))
+
+        if not self._in_executor(prepared_call.executor):
+            self.logger.trace('Calling %r in executor %r', name, prepared_call.executor)
+            return self.run_coroutine(self.run_in_executor(prepared_call.executor, methodobj, *prepared_call.args))
+
+        self.logger.trace('Calling %r in current thread', name)
+        return methodobj(*prepared_call.args)
+
+    def _in_executor(self, executor):
+        if isinstance(executor, concurrent.futures.thread.ThreadPoolExecutor):
+            return threading.current_thread() in executor._threads
+        elif isinstance(executor, IoThreadPoolExecutor):
+            return any(worker.thread == threading.current_thread() for worker in executor.workers)
+        else:
+            raise RuntimeError(f"Unknown executor: {executor!r}")
 
     def run_coroutine(self, coro, wait=True):
         if threading.get_ident() == self.__thread_id:
@@ -1375,6 +1425,10 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin):
         except RuntimeError as e:
             if e.args[0] != "Event loop is closed":
                 raise
+
+        # As we don't do clean shutdown (which will terminate multiprocessing children gracefully),
+        # let's just kill our entire process group
+        os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
 
         # We use "_exit" specifically as otherwise process pool executor won't let middlewared process die because
         # it is still active. We don't initiate a shutdown for it because it may hang forever for any reason

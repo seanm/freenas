@@ -7,6 +7,7 @@ import asyncio
 import errno
 import os
 import shutil
+import subprocess
 import uuid
 
 SYSDATASET_PATH = '/var/db/system'
@@ -258,7 +259,7 @@ class SystemDatasetService(ConfigService):
         if not os.path.isdir(SYSDATASET_PATH):
             if os.path.exists(SYSDATASET_PATH):
                 os.unlink(SYSDATASET_PATH)
-            os.mkdir(SYSDATASET_PATH)
+            os.makedirs(SYSDATASET_PATH)
 
         acltype = await self.middleware.call('zfs.dataset.query', [('id', '=', config['basename'])])
         if acltype and acltype[0]['properties']['acltype']['value'] == 'off':
@@ -331,14 +332,17 @@ class SystemDatasetService(ConfigService):
 
     async def __umount(self, pool, uuid):
         for dataset, name in reversed(self.__get_datasets(pool, uuid)):
-            await run('umount', '-f', dataset, check=False)
+            try:
+                await run('umount', '-f', dataset)
+            except subprocess.CalledProcessError:
+                self.logger.warning('Unable to umount %r', dataset)
 
     def __get_datasets(self, pool, uuid):
         return [(f'{pool}/.system', '')] + [
             (f'{pool}/.system/{i}', i) for i in [
                 'cores', 'samba4', f'syslog-{uuid}',
                 f'rrd-{uuid}', f'configs-{uuid}', 'webui', 'services'
-            ]
+            ] + (['services/docker'] if osc.IS_LINUX else [])
         ]
 
     async def __nfsv4link(self, config):
@@ -412,6 +416,10 @@ class SystemDatasetService(ConfigService):
             restart.insert(0, 'cifs')
 
         try:
+            if osc.IS_LINUX:
+                await self.middleware.call('cache.put', 'use_syslog_dataset', False)
+                await self.middleware.call('service.restart', 'syslogd')
+
             for i in restart:
                 await self.middleware.call('service.stop', i)
 
@@ -424,8 +432,12 @@ class SystemDatasetService(ConfigService):
                     proc = await Popen(f'zfs list -H -o name {_from}/.system|xargs zfs destroy -r', shell=True)
                     await proc.communicate()
 
-                os.rmdir('/tmp/system.new')
+                    os.rmdir('/tmp/system.new')
+                else:
+                    raise CallError(f'Failed to rsync from {SYSDATASET_PATH}: {cp.stderr.decode()}')
         finally:
+            if osc.IS_LINUX:
+                await self.middleware.call('cache.pop', 'use_syslog_dataset')
 
             restart.reverse()
             for i in restart:
@@ -438,6 +450,9 @@ async def pool_post_import(middleware, pool):
     """
     On pool import we may need to reconfigure system dataset.
     """
+    if pool is None:
+        return
+
     await middleware.call('systemdataset.setup')
 
 

@@ -20,6 +20,8 @@ class SMARTDService(SimpleService):
     freebsd_pidfile = "/var/run/smartd-daemon.pid"
     freebsd_procname = "smartd"
 
+    systemd_unit = "smartmontools"
+
     async def _get_state_freebsd(self):
         result = await super()._get_state_freebsd()
         if result.running:
@@ -57,7 +59,7 @@ class SMARTDService(SimpleService):
     async def _stop_freebsd(self):
         pid = await self.middleware.run_in_thread(self._freebsd_initializing_smartd_pid)
         if pid is None:
-            return await super()._start_freebsd()
+            return await super()._stop_freebsd()
 
         os.kill(pid, signal.SIGKILL)
 

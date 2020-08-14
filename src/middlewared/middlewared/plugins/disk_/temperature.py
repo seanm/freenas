@@ -50,11 +50,11 @@ class DiskService(Service):
     @private
     async def disks_for_temperature_monitoring(self):
         return [
-            disk['devname']
+            disk['name']
             for disk in await self.middleware.call(
                 'disk.query',
                 [
-                    ['devname', '!=', None],
+                    ['name', '!=', None],
                     ['togglesmart', '=', True],
                     # Polling for disk temperature does not allow them to go to sleep automatically unless
                     # hddstandby_force is used
@@ -76,11 +76,13 @@ class DiskService(Service):
         """
         Returns temperature for device `name` using specified S.M.A.R.T. `powermode`.
         """
-        if name.startswith('da') and False:
+        if name.startswith('da'):
             smartctl_args = await self.middleware.call('disk.smartctl_args', name) or []
             if not any(s.startswith('/dev/arcmsr') for s in smartctl_args):
                 try:
-                    return await self.middleware.run_in_thread(lambda: cam.CamDevice(name).get_temperature())
+                    temperature = await self.middleware.run_in_thread(lambda: cam.CamDevice(name).get_temperature())
+                    if temperature is not None:
+                        return temperature
                 except Exception:
                     pass
 

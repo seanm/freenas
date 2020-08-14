@@ -10,19 +10,12 @@ import os
 import re
 import subprocess
 
-try:
-    from bsd import geom
-    from nvme import get_nsid
-    import sysctl
-except ImportError:
-    geom = None
-    get_nsid = None
-    sysctl = None
-
 from middlewared.schema import Dict, Int, Str, accepts
 from middlewared.service import CallError, CRUDService, filterable, private
+from middlewared.service_exception import MatchNotFound
 import middlewared.sqlalchemy as sa
 from middlewared.utils import filter_list
+from middlewared.utils.osc import IS_FREEBSD
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +85,7 @@ class EnclosureService(CRUDService):
                         "name": elem.name,
                         "descriptor": elem.descriptor,
                         "status": elem.status,
+                        "value": elem.value,
                         "value_raw": hex(elem.value_raw),
                     }
                     if hasattr(elem, "device_slot_set"):
@@ -112,7 +106,12 @@ class EnclosureService(CRUDService):
 
             enclosures.append(enclosure)
 
+        enclosures = self.middleware.call_sync("enclosure.map_enclosures", enclosures)
+
         enclosures.extend(self.middleware.call_sync("enclosure.m50_plx_enclosures"))
+
+        for number, enclosure in enumerate(enclosures):
+            enclosure["number"] = number
 
         return filter_list(enclosures, filters=filters or [], options=options or {})
 
@@ -134,36 +133,82 @@ class EnclosureService(CRUDService):
 
         return await self._get_instance(id)
 
-    @accepts(Str("disk"))
-    def find_disk_enclosure(self, disk):
-        encs = self.__get_enclosures()
-        elem = encs.find_device_slot(disk)
-        return elem.enclosure.devname
+    def _get_slot(self, slot_filter, enclosure_query=None):
+        for enclosure in self.middleware.call_sync("enclosure.query", enclosure_query or []):
+            try:
+                elements = next(filter(lambda element: element["name"] == "Array Device Slot",
+                                       enclosure["elements"]))["elements"]
+                slot = next(filter(slot_filter, elements))
+                return enclosure, slot
+            except StopIteration:
+                pass
+
+        raise MatchNotFound()
+
+    def _get_slot_for_disk(self, disk):
+        return self._get_slot(lambda element: element["data"]["Device"] == disk)
+
+    def _get_ses_slot(self, enclosure, element):
+        enclosure_id = enclosure["id"]
+        slot = element["slot"]
+        if enclosure_id.startswith("mapped_enclosure_"):
+            enclosure_id = element["original"]["enclosure_id"]
+            slot = element["original"]["slot"]
+
+        ses_enclosures = self.__get_enclosures()
+        ses_enclosure = ses_enclosures.get_by_encid(enclosure_id)
+        if ses_enclosure is None:
+            raise MatchNotFound()
+        ses_slot = ses_enclosure.get_by_slot(slot)
+        if ses_slot is None:
+            raise MatchNotFound()
+        return ses_slot
+
+    def _get_ses_slot_for_disk(self, disk):
+        # This can also return SES slot for disk that is not present in the system
+        try:
+            enclosure, element = self._get_slot_for_disk(disk)
+        except MatchNotFound:
+            disk = self.middleware.call_sync(
+                "disk.query",
+                [["devname", "=", disk]],
+                {"get": True, "extra": {"include_expired": True}, "order_by": ["expiretime"]},
+            )
+            if disk["enclosure"]:
+                enclosure, element = self._get_slot(lambda element: element["slot"] == disk["enclosure"]["slot"],
+                                                    [["number", "=", disk["enclosure"]["number"]]])
+            else:
+                raise MatchNotFound()
+
+        return self._get_ses_slot(enclosure, element)
 
     @accepts(Str("enclosure_id"), Int("slot"), Str("status", enum=["CLEAR", "FAULT", "IDENTIFY"]))
     def set_slot_status(self, enclosure_id, slot, status):
-        encs = self.__get_enclosures()
-        enc = encs.get_by_encid(enclosure_id)
-        ele = enc.get_by_slot(slot)
-        if not ele.device_slot_set(status.lower()):
-            raise CallError()
+        enclosure, element = self._get_slot(lambda element: element["slot"] == slot, [["id", "=", enclosure_id]])
+        ses_slot = self._get_ses_slot(enclosure, element)
+        if not ses_slot.device_slot_set(status.lower()):
+            raise CallError("Error setting slot status")
 
     @private
     def sync_disk(self, id):
-        disk = self.middleware.call_sync('disk.query', [['identifier', '=', id]], {'get': True})
+        disk = self.middleware.call_sync(
+            'disk.query',
+            [['identifier', '=', id]],
+            {'get': True, "extra": {'include_expired': True}}
+        )
 
         try:
-            enclosures = self.__get_enclosures()
-            element = enclosures.find_device_slot(disk['name'])
-            enclosure = {
-                'number': element.enclosure.num,
-                'slot': element.slot
+            enclosure, element = self._get_slot_for_disk(disk["name"])
+        except MatchNotFound:
+            disk_enclosure = None
+        else:
+            disk_enclosure = {
+                "number": enclosure["number"],
+                "slot": element["slot"],
             }
-        except Exception:
-            enclosure = None
 
-        if enclosure != disk['enclosure']:
-            self.middleware.call_sync('disk.update', id, {'enclosure': enclosure})
+        if disk_enclosure != disk['enclosure']:
+            self.middleware.call_sync('disk.update', id, {'enclosure': disk_enclosure})
 
     @private
     @accepts(Str("pool", null=True, default=None))
@@ -171,6 +216,8 @@ class EnclosureService(CRUDService):
         """
         Sync enclosure of a given ZFS pool
         """
+
+        # As we are only interfacing with SES we can skip mapping enclosures or working with non-SES enclosures
 
         encs = self.__get_enclosures()
         if len(list(encs)) == 0:
@@ -182,7 +229,6 @@ class EnclosureService(CRUDService):
         else:
             pools = [pool]
 
-        geom.scan()
         seen_devs = []
         label2disk = {}
         for pool in pools:
@@ -204,12 +250,12 @@ class EnclosureService(CRUDService):
                 seen_devs.append(label)
 
                 disk = label2disk.get(label)
-                enc_slot = self.__get_enclosure_slot_from_disk(disk)
-                if enc_slot:
-                    enc = encs.get_by_id(enc_slot[0])
-                    element = enc.get_by_slot(enc_slot[1])
-                    if element:
-                        element.device_slot_set("fault")
+                try:
+                    element = self._get_ses_slot_for_disk(disk)
+                except MatchNotFound:
+                    pass
+                else:
+                    element.device_slot_set("fault")
 
             # We want spares to only identify slot for Z-series
             # See #32706
@@ -250,13 +296,11 @@ class EnclosureService(CRUDService):
 
                 seen_devs.append(label)
 
-                slot = self.__get_enclosure_slot_from_disk(disk)
-                if not slot:
-                    continue
-
-                enc = encs.get_by_id(slot[0])
-                element = enc.get_by_slot(slot[1])
-                if element:
+                try:
+                    element = self._get_ses_slot_for_disk(disk)
+                except MatchNotFound:
+                    pass
+                else:
                     element.device_slot_set("clear")
 
         disks = []
@@ -265,8 +309,9 @@ class EnclosureService(CRUDService):
             if disk.startswith("multipath/"):
                 try:
                     disks.append(self.middleware.call_sync(
-                        "disk.query", [["devname", "=", disk]],
-                        {"get": True, "order_by": ["expiretime"]}
+                        "disk.query",
+                        [["devname", "=", disk]],
+                        {"get": True, "extra": {"include_expired": True}, "order_by": ["expiretime"]},
                     )["name"])
                 except IndexError:
                     pass
@@ -282,156 +327,25 @@ class EnclosureService(CRUDService):
                     element.device_slot_set("clear")
 
     def __get_enclosures(self):
-        return Enclosures(self.__get_enclosures_stat(), {
+        return Enclosures(self.middleware.call_sync("enclosure.get_ses_enclosures"), {
             label["encid"]: label["label"]
             for label in self.middleware.call_sync("datastore.query", "truenas.enclosurelabel")
-        })
-
-    def __get_enclosures_stat(self):
-        """
-        Call getencstat for all enclosures devices avaiable
-
-        Returns:
-            dict: all enclosures available with index as key
-        """
-
-        output = {}
-        encnumb = 0
-        while os.path.exists(f'/dev/ses{encnumb}'):
-            out = self.__get_enclosure_stat(encnumb)
-            if out:
-                # In short, getencstat reserves the exit codes for
-                # failing to change states and doesn't actually
-                # error out if it can't read or poke at the enclosure
-                # device.
-                output[encnumb] = out
-            encnumb += 1
-
-        return output
-
-    def __get_enclosure_stat(self, encnumb):
-        """
-        Call getencstat for single enclosures device
-        """
-
-        cmd = f"/usr/sbin/getencstat -V /dev/ses{encnumb}"
-        p1 = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, close_fds=True)
-        # getencstat may return not valid utf8 bytes (especially on Legacy TrueNAS)
-        out = p1.communicate()[0].decode('utf8', 'ignore')
-        return out
-
-    def __get_enclosure_slot_from_disk(self, disk):
-        enclosures = self.__get_enclosures()
-
-        try:
-            element = enclosures.find_device_slot(disk)
-            return element.enclosure.num, element.slot
-        except AssertionError:
-            pass
-
-        self.logger.debug("Disk %r not found in enclosure, trying from disk cache table", disk)
-
-        try:
-            disk = self.middleware.call_sync(
-                "disk.query", [["devname", "=", disk]],
-                {"get": True, "order_by": ["expiretime"]},
-            )
-            if disk["enclosure"]:
-                return disk["enclosure"]["number"], disk["enclosure"]["slot"]
-        except IndexError:
-            pass
-
-    RE_PCI = re.compile(r"pci([0-9]+)")
-    RE_PCIB = re.compile(r"pcib([0-9]+)")
-    RE_SLOT = re.compile(r"slot=([0-9]+)")
-
-    @private
-    def m50_plx_enclosures(self):
-        system_product = self.middleware.call_sync("system.info")["system_product"]
-        if not ("TRUENAS-M50" in system_product or "TRUENAS-M60" in system_product):
-            return []
-
-        nvme_to_nvd = {}
-        for disk in self.middleware.call_sync("disk.query", [["devname", "^", "nvd"]]):
-            try:
-                n = int(disk["devname"][len("nvd"):])
-            except ValueError:
-                continue
-            nvme = get_nsid(f"/dev/{disk['devname']}")
-            if nvme is not None:
-                nvme_to_nvd[int(nvme[4:])] = n
-
-        slot_to_nvd = {}
-        for nvme, nvd in nvme_to_nvd.items():
-            try:
-                pci = sysctl.filter(f"dev.nvme.{nvme}.%parent")[0].value
-                m = re.match(self.RE_PCI, pci)
-                if not m:
-                    continue
-
-                pcib = sysctl.filter(f"dev.pci.{m.group(1)}.%parent")[0].value
-                m = re.match(self.RE_PCIB, pcib)
-                if not m:
-                    continue
-
-                pnpinfo = sysctl.filter(f"dev.pcib.{m.group(1)}.%pnpinfo")[0].value
-                if "vendor=0x10b5 device=0x8717" not in pnpinfo:
-                    continue
-
-                location = sysctl.filter(f"dev.pcib.{m.group(1)}.%location")[0].value
-                m = re.match(self.RE_SLOT, location)
-                if not m:
-                    continue
-                slot = int(m.group(1))
-            except IndexError:
-                continue
-
-            slot_to_nvd[slot] = f"nvd{nvd}"
-
-        elements = []
-        for slot in range(1, 5):
-            device = slot_to_nvd.get(slot, None)
-
-            if device is not None:
-                status = "OK"
-                value_raw = "0x1000000"
-            else:
-                status = "Not Installed"
-                value_raw = "0x05000000"
-
-            elements.append({
-                "slot": slot,
-                "data": {
-                    "Descriptor": f"Disk #{slot}",
-                    "Status": status,
-                    "Value": "None",
-                    "Device": device,
-                },
-                "name": "Array Device Slot",
-                "descriptor": f"Disk #{slot}",
-                "status": status,
-                "value_raw": value_raw,
-            })
-
-        return [
-            {
-                "id": "m50_plx_enclosure",
-                "name": "Rear NVME U.2 Hotswap Bays",
-                "model": "M50/60 Series",
-                "controller": True,
-                "label": "Rear NVME U.2 Hotswap Bays",
-                "elements": elements,
-            }
-        ]
+        }, self.middleware.call_sync("system.info"))
 
 
 class Enclosures(object):
 
-    def __init__(self, stat, labels):
+    def __init__(self, stat, labels, system_info):
+        blacklist = [
+            "VirtualSES",
+        ]
+        if system_info["system_product"] and system_info["system_product"].startswith("TRUENAS-"):
+            blacklist.append("AHCI SGPIO Enclosure 2.00")
+
         self.__enclosures = []
         for num, data in stat.items():
             enclosure = Enclosure(num=num, data=data, labels=labels)
-            if "VirtualSES" in enclosure.encname:
+            if any(s in enclosure.encname for s in blacklist):
                 continue
 
             self.__enclosures.append(enclosure)
@@ -467,7 +381,10 @@ class Enclosure(object):
 
     def __init__(self, num, data, labels):
         self.num = num
-        self.devname = f"ses{num}"
+        if IS_FREEBSD:
+            self.devname = f"ses{num}"
+        else:
+            self.devname, data = data
         self.encname = ""
         self.encid = ""
         self.model = ""
@@ -480,6 +397,12 @@ class Enclosure(object):
         self.enclabel = labels.get(self.encid)
 
     def _parse(self, data):
+        if IS_FREEBSD:
+            self._parse_freebsd(data)
+        else:
+            self._parse_linux(data)
+
+    def _parse_freebsd(self, data):
         status = re.search(
             r'Enclosure Name: (.+)',
             data)
@@ -494,6 +417,97 @@ class Enclosure(object):
         if status:
             self.encid = status.group(1)
 
+        self._set_model(data)
+
+        status = re.search(
+            r'Enclosure Status <(.+)>',
+            data)
+        if status:
+            self.status = status.group(1)
+
+        lname = ""
+        elements = re.findall(
+            r'Element\s+(?P<element>.+?): (?P<name>.+?)'
+            r', status: (?P<status>.+?) \((?P<value>[^)]+)\)'
+            '(?:, descriptor: \'(?P<desc>[^\']+)\')?'
+            '(?:, dev: \'(?P<dev>.+?)\')?',
+            data)
+        for element in elements:
+            slot, name, status, value, desc, dev = element
+            if name != lname:
+                lname = name
+                self.descriptors[name] = desc
+                continue
+            newvalue = self._parse_raw_value(value)
+            slot = int(slot, 16)
+            if not desc:
+                desc = f"{name} {slot}"
+            ele = self._enclosure_element(
+                slot,
+                name,
+                newvalue,
+                status,
+                desc,
+                dev)
+            if ele is not None:
+                self.append(ele)
+
+    def _parse_linux(self, data):
+        cf, es = data
+
+        self.encname = re.sub(r"\s+", " ", cf.splitlines()[0].strip())
+
+        if m := re.search(r"\s+enclosure logical identifier \(hex\): ([0-9a-f]+)", cf):
+            self.encid = m.group(1)
+
+        self._set_model(cf)
+
+        self.status = "OK"
+
+        element_type = None
+        element_number = None
+        for line in es.splitlines():
+            if m := re.match(r"\s+Element type: (.+), subenclosure", line):
+                element_type = m.group(1)
+
+                if element_type != "Audible alarm":
+                    element_type = " ".join([
+                        word[0].upper() + word[1:]
+                        for word in element_type.split()
+                    ])
+                if element_type == "Temperature Sensor":
+                    element_type = "Temperature Sensors"
+
+                element_number = None
+            elif m := re.match(r"\s+Element ([0-9]+) descriptor:", line):
+                element_number = int(m.group(1))
+            elif m := re.match(r"\s+([0-9a-f ]{11})", line):
+                if element_type is not None and element_number is not None:
+                    dev = ""
+                    if element_type == "Array Device Slot":
+                        try:
+                            dev = os.listdir(
+                                f"/sys/class/enclosure/{self.devname}/Disk #{element_number:02X}/device/block"
+                            )[0]
+                        except (FileNotFoundError, IndexError):
+                            pass
+
+                    element = self._enclosure_element(
+                        element_number,
+                        element_type,
+                        self._parse_raw_value(m.group(1)),
+                        None,
+                        "",
+                        dev,
+                    )
+                    if element is not None:
+                        self.append(element)
+
+                element_number = None
+            else:
+                element_number = None
+
+    def _set_model(self, data):
         if M_SERIES_REGEX.match(self.encname):
             self.model = "M Series"
             self.controller = True
@@ -517,41 +531,12 @@ class Enclosure(object):
         elif self.encname.startswith("CELESTIC X2012"):
             self.model = "ES12"
 
-        status = re.search(
-            r'Enclosure Status <(.+)>',
-            data)
-        if status:
-            self.status = status.group(1)
-
-        lname = ""
-        elements = re.findall(
-            r'Element\s+(?P<element>.+?): (?P<name>.+?)'
-            r', status: (?P<status>.+?) \((?P<value>[^)]+)\)'
-            '(?:, descriptor: \'(?P<desc>[^\']+)\')?'
-            '(?:, dev: \'(?P<dev>.+?)\')?',
-            data)
-        for element in elements:
-            slot, name, status, value, desc, dev = element
-            if name != lname:
-                lname = name
-                self.descriptors[name] = desc
-                continue
-            newvalue = 0
-            for i, v in enumerate(value.split(' ')):
-                v = int(v.replace("0x", ""), 16)
-                newvalue |= v << (2 * (3 - i)) * 4
-            slot = int(slot, 16)
-            if not desc:
-                desc = f"{name} {slot}"
-            ele = self._enclosure_element(
-                slot,
-                name,
-                newvalue,
-                status,
-                desc,
-                dev)
-            if ele is not None:
-                self.append(ele)
+    def _parse_raw_value(self, value):
+        newvalue = 0
+        for i, v in enumerate(value.split(' ')):
+            v = int(v.replace("0x", ""), 16)
+            newvalue |= v << (2 * (3 - i)) * 4
+        return newvalue
 
     def iter_by_name(self):
         return OrderedDict(sorted(self.__elementsbyname.items()))
@@ -1042,6 +1027,12 @@ class ArrayDevSlot(Element):
             True if the command succeeded, False otherwise
         """
 
+        if IS_FREEBSD:
+            return self._device_slot_set_freebsd(status)
+        else:
+            return self._device_slot_set_linux(status)
+
+    def _device_slot_set_freebsd(self, status):
         proc = subprocess.Popen(
             ["/usr/bin/pgrep", "setobjstat"],
             stdout=subprocess.PIPE,
@@ -1062,6 +1053,25 @@ class ArrayDevSlot(Element):
         )
         proc.communicate()
         return not bool(proc.returncode)
+
+    def _device_slot_set_linux(self, status):
+        if status == "clear":
+            commands = ["--clear=fault", "--clear=ident"]
+        else:
+            if status == "identify":
+                commands = ["--set=ident"]
+            else:
+                commands = [f"--set={status}"]
+
+        ok = True
+        for cmd in commands:
+            cmd = ["sg_ses", "--index", str(self.slot), cmd, f"/dev/{self.enclosure.devname}"]
+            p = subprocess.run(cmd, encoding="utf-8", errors="ignore", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if p.returncode != 0:
+                logger.warning("%r failed: %s", cmd, p.stderr)
+                ok = False
+
+        return ok
 
     @property
     def identify(self):
@@ -1216,10 +1226,35 @@ async def devd_zfs_hook(middleware, data):
         await middleware.call('enclosure.sync_zpool')
 
 
+async def zfs_events_hook(middleware, data):
+    event_id = data['class']
+
+    if event_id in [
+        'sysevent.fs.zfs.config_sync',
+        'sysevent.fs.zfs.vdev_remove',
+    ]:
+        await middleware.call('enclosure.sync_zpool')
+
+
+async def udev_block_devices_hook(middleware, data):
+    if data.get('SUBSYSTEM') != 'block' or data.get('DEVTYPE') != 'disk' or data['SYS_NAME'].startswith((
+        'sr', 'md', 'dm-', 'loop'
+    )):
+        return
+
+    if data['ACTION'] in ['add', 'remove']:
+        await middleware.call('enclosure.sync_zpool')
+
+
 async def pool_post_delete(middleware, id):
     await middleware.call('enclosure.sync_zpool')
 
 
 def setup(middleware):
-    middleware.register_hook('devd.zfs', devd_zfs_hook)
+    if IS_FREEBSD:
+        middleware.register_hook('devd.zfs', devd_zfs_hook)
+    else:
+        middleware.register_hook('zfs.pool.events', zfs_events_hook)
+        middleware.register_hook('udev.block', udev_block_devices_hook)
+
     middleware.register_hook('pool.post_delete', pool_post_delete)

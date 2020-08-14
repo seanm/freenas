@@ -227,12 +227,29 @@ class ZFSPoolService(CRUDService):
         except libzfs.ZFSException as e:
             raise CallError(str(e), e.code)
 
-    @accepts(Str('pool'), Str('label'))
-    def detach(self, name, label):
+    @accepts(Str('pool'), Str('label'), Dict('options', Bool('clear_label', default=False)))
+    def detach(self, name, label, options):
         """
         Detach device `label` from the pool `pool`.
         """
-        self.__zfs_vdev_operation(name, label, lambda target: target.detach())
+        self.detach_remove_impl('detach', name, label, options)
+
+    def detach_remove_impl(self, op, name, label, options):
+        def impl(target):
+            getattr(target, op)()
+            if options['clear_label']:
+                self.clear_label(target.path)
+        self.__zfs_vdev_operation(name, label, impl)
+
+    @accepts(Str('device'))
+    def clear_label(self, device):
+        """
+        Clear label from `device`.
+        """
+        try:
+            libzfs.clear_label(device)
+        except (libzfs.ZFSException, OSError) as e:
+            raise CallError(str(e))
 
     @accepts(Str('pool'), Str('label'))
     def offline(self, name, label):
@@ -250,12 +267,12 @@ class ZFSPoolService(CRUDService):
         """
         self.__zfs_vdev_operation(name, label, lambda target, *args: target.online(*args), expand)
 
-    @accepts(Str('pool'), Str('label'))
-    def remove(self, name, label):
+    @accepts(Str('pool'), Str('label'), Dict('options', Bool('clear_label', default=False)))
+    def remove(self, name, label, options):
         """
         Remove device `label` from the pool `pool`.
         """
-        self.__zfs_vdev_operation(name, label, lambda target: target.remove())
+        self.detach_remove_impl('remove', name, label, options)
 
     @accepts(Str('pool'), Str('label'), Str('dev'))
     def replace(self, name, label, dev):
@@ -373,8 +390,8 @@ class ZFSPoolService(CRUDService):
                     )
 
     @accepts(Str('pool'))
-    async def find_not_online(self, pool):
-        pool = await self.middleware.call('zfs.pool.query', [['id', '=', pool]], {'get': True})
+    def find_not_online(self, pool):
+        pool = self.middleware.call_sync('zfs.pool.query', [['id', '=', pool]], {'get': True})
 
         unavails = []
         for nodes in pool['groups'].values():
@@ -409,6 +426,22 @@ class ZFSDatasetService(CRUDService):
         namespace = 'zfs.dataset'
         private = True
         process_pool = True
+
+    def locked_datasets(self):
+        try:
+            about_to_lock_dataset = self.middleware.call_sync('cache.get', 'about_to_lock_dataset')
+        except KeyError:
+            about_to_lock_dataset = None
+
+        or_filters = [
+            'OR', [['key_loaded', '=', False]] + (
+                [['id', '=', about_to_lock_dataset], ['id', '^', f'{about_to_lock_dataset}/']]
+                if about_to_lock_dataset else []
+            )
+        ]
+        return self.query([['encrypted', '=', True], or_filters], {
+            'extra': {'properties': ['encryption', 'keystatus', 'mountpoint']}, 'select': ['id', 'mountpoint']
+        })
 
     def flatten_datasets(self, datasets):
         return sum([[deepcopy(ds)] + self.flatten_datasets(ds['children']) for ds in datasets], [])
@@ -500,6 +533,16 @@ class ZFSDatasetService(CRUDService):
     def common_encryption_checks(self, ds):
         if not ds.encrypted:
             raise CallError(f'{id} is not encrypted')
+
+    def path_to_dataset(self, path):
+        with libzfs.ZFS() as zfs:
+            try:
+                zh = zfs.get_dataset_by_path(path)
+                ds_name = zh.name
+            except libzfs.ZFSException:
+                ds_name = None
+
+        return ds_name
 
     def get_quota(self, ds, quota_type):
         if quota_type == 'dataset':

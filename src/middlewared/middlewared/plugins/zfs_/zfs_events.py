@@ -142,7 +142,7 @@ async def zfs_events(middleware, data):
         # Swap must be configured only on disks being used by some pool,
         # for this reason we must react to certain types of ZFS events to keep
         # it in sync every time there is a change.
-        await middleware.call('disk.swaps_configure')
+        asyncio.ensure_future(middleware.call('disk.swaps_configure'))
     elif (
         event_id == 'sysevent.fs.zfs.history_event' and data.get(
             'history_internal_name'
@@ -153,6 +153,7 @@ async def zfs_events(middleware, data):
                 ['OR', [['name', '=', data['history_dsname']], ['name', '^', f'{data["history_dsname"]}/']]]
             ]
         )
+        await middleware.call_hook('dataset.post_delete', data['history_dsname'])
 
 
 def setup(middleware):

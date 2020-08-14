@@ -4,7 +4,9 @@ from middlewared.service import (
 )
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run, filter_list
+from middlewared.utils.osc import IS_FREEBSD
 from middlewared.validators import Email
+from middlewared.plugins.smb import SMBBuiltin
 
 import asyncio
 import binascii
@@ -16,6 +18,7 @@ import random
 import shlex
 import shutil
 import string
+import stat
 import subprocess
 import time
 
@@ -73,7 +76,7 @@ class UserModel(sa.Model):
     bsdusr_uid = sa.Column(sa.Integer())
     bsdusr_username = sa.Column(sa.String(16), default='User &')
     bsdusr_unixhash = sa.Column(sa.String(128), default='*')
-    bsdusr_smbhash = sa.Column(sa.String(128), default='*')
+    bsdusr_smbhash = sa.Column(sa.EncryptedText(), default='*')
     bsdusr_home = sa.Column(sa.String(255), default="/nonexistent")
     bsdusr_shell = sa.Column(sa.String(120), default='/bin/csh')
     bsdusr_full_name = sa.Column(sa.String(120))
@@ -135,7 +138,6 @@ class UserService(CRUDService):
         """
         if not filters:
             filters = []
-        filters += self._config.datastore_filters or []
 
         options = options or {}
         options['extend'] = self._config.datastore_extend
@@ -169,7 +171,7 @@ class UserService(CRUDService):
         Bool('group_create', default=False),
         Str('home', default='/nonexistent'),
         Str('home_mode', default='755'),
-        Str('shell', default='/bin/csh'),
+        Str('shell', default='/bin/csh' if IS_FREEBSD else '/usr/bin/zsh'),
         Str('full_name', required=True),
         Str('email', validators=[Email()], null=True, default=None),
         Str('password', private=True),
@@ -313,7 +315,7 @@ class UserService(CRUDService):
         if data['smb']:
             await self.__set_smbpasswd(data['username'])
 
-        if os.path.exists(data['home']):
+        if os.path.isdir(SKEL_PATH) and os.path.exists(data['home']):
             for f in os.listdir(SKEL_PATH):
                 if f.startswith('dot'):
                     dest_file = os.path.join(data['home'], f[3:])
@@ -325,7 +327,6 @@ class UserService(CRUDService):
                         'path': dest_file,
                         'uid': data['uid'],
                         'gid': group['gid'],
-                        'options': {'recursive': True}
                     })
 
             data['sshpubkey'] = sshpubkey
@@ -368,6 +369,12 @@ class UserService(CRUDService):
 
         await self.__common_validation(verrors, data, 'user_update', pk=pk)
 
+        try:
+            st = os.stat(user.get("home", "/nonexistent")).st_mode
+            old_mode = f'{stat.S_IMODE(st):03o}'
+        except FileNotFoundError:
+            old_mode = None
+
         home = data.get('home') or user['home']
         has_home = home != '/nonexistent'
         # root user (uid 0) is an exception to the rule
@@ -376,11 +383,41 @@ class UserService(CRUDService):
 
         # Do not allow attributes to be changed for builtin user
         if user['builtin']:
-            for i in ('group', 'home', 'home_mode', 'uid', 'username'):
+            for i in ('group', 'home', 'home_mode', 'uid', 'username', 'smb'):
                 if i in data:
                     verrors.add(f'user_update.{i}', 'This attribute cannot be changed')
 
+        if not user['smb'] and data.get('smb') and not data.get('password'):
+            # Changing from non-smb user to smb user requires re-entering password.
+            verrors.add('user_update.smb',
+                        'Password must be changed in order to enable SMB authentication')
+
         verrors.check()
+
+        must_change_pdb_entry = False
+        for k in ('username', 'password', 'locked'):
+            new_val = data.get(k)
+            old_val = user.get(k)
+            if new_val is not None and old_val != new_val:
+                if k == 'username':
+                    try:
+                        await self.middleware.call("smb.remove_passdb_user", old_val)
+                    except Exception:
+                        self.logger.debug("Failed to remove passdb entry for user [%s]",
+                                          old_val, exc_info=True)
+
+                must_change_pdb_entry = True
+
+        if user['smb'] is True and data.get('smb') is False:
+            try:
+                must_change_pdb_entry = False
+                await self.middleware.call("smb.remove_passdb_user", user['username'])
+            except Exception:
+                self.logger.debug("Failed to remove passdb entry for user [%s]",
+                                  user['username'], exc_info=True)
+
+        if user['smb'] is False and data.get('smb') is True:
+            must_change_pdb_entry = True
 
         # Copy the home directory if it changed
         if (
@@ -400,11 +437,18 @@ class UserService(CRUDService):
         if home_copy and not os.path.isdir(user['home']):
             try:
                 os.makedirs(user['home'])
-                await self.middleware.call('filesystem.chown', {
+                mode_to_set = user.get('home_mode')
+                if not mode_to_set:
+                    mode_to_set = '700' if old_mode is None else old_mode
+
+                perm_job = await self.middleware.call('filesystem.setperm', {
                     'path': user['home'],
                     'uid': user['uid'],
                     'gid': group['bsdgrp_gid'],
+                    'mode': mode_to_set,
+                    'options': {'stripacl': True},
                 })
+                await perm_job.wait()
             except OSError:
                 self.logger.warn('Failed to chown homedir', exc_info=True)
             if not os.path.isdir(user['home']):
@@ -419,7 +463,7 @@ class UserService(CRUDService):
                 try:
                     # Strip ACL before chmod. This is required when aclmode = restricted
                     setfacl = subprocess.run(['/bin/setfacl', '-b', user['home']], check=False)
-                    if setfacl.returncode != 0:
+                    if setfacl.returncode != 0 and setfacl.stderr:
                         self.logger.debug('Failed to strip ACL: %s', setfacl.stderr.decode())
                     os.chmod(user['home'], int(home_mode, 8))
                 except OSError:
@@ -465,7 +509,7 @@ class UserService(CRUDService):
         await self.middleware.call('datastore.update', 'account.bsdusers', pk, user, {'prefix': 'bsdusr_'})
 
         await self.middleware.call('service.reload', 'user')
-        if user['smb']:
+        if user['smb'] and must_change_pdb_entry:
             await self.__set_smbpasswd(user['username'])
 
         return pk
@@ -663,6 +707,19 @@ class UserService(CRUDService):
                     f'The username "{data["username"]}" already exists.',
                     errno.EEXIST
                 )
+            if data.get('smb'):
+                smb_users = await self.middleware.call('datastore.query',
+                                                       'account.bsdusers',
+                                                       [('smb', '=', True)] + exclude_filter,
+                                                       {'prefix': 'bsdusr_'})
+
+                if any(filter(lambda x: data['username'].casefold() == x['username'].casefold(), smb_users)):
+                    verrors.add(
+                        f'{schema}.smb',
+                        f'Username "{data["username"]}" conflicts with existing SMB user. Note that SMB '
+                        f'usernames are case-insensitive.',
+                        errno.EEXIST,
+                    )
 
         password = data.get('password')
         if password and '?' in password:
@@ -699,6 +756,11 @@ class UserService(CRUDService):
                         f'{schema}.home',
                         f'The path for the home directory "({data["home"]})" '
                         'must include a volume or dataset.'
+                    )
+                elif await self.middleware.call('pool.dataset.path_in_locked_datasets', data['home']):
+                    verrors.add(
+                        f'{schema}.home',
+                        'Path component for "Home Directory" is currently encrypted and locked'
                     )
 
         if 'home_mode' in data:
@@ -884,7 +946,6 @@ class GroupService(CRUDService):
         """
         if not filters:
             filters = []
-        filters += self._config.datastore_filters or []
 
         options = options or {}
         options['extend'] = self._config.datastore_extend
@@ -982,20 +1043,33 @@ class GroupService(CRUDService):
         """
 
         group = await self._get_instance(pk)
+        add_groupmap = False
 
         verrors = ValidationErrors()
         await self.__common_validation(verrors, data, 'group_update', pk=pk)
         verrors.check()
+        old_smb = group['smb']
 
         group.update(data)
-        delete_groupmap = False
         group.pop('users', None)
+        new_smb = group['smb']
 
         if 'name' in data and data['name'] != group['group']:
-            delete_groupmap = group['group']
+            if g := (await self.middleware.call('smb.groupmap_list')).get(group['group']):
+                await self.middleware.call(
+                    'smb.groupmap_delete',
+                    {"sid": g['SID']}
+                )
+
             group['group'] = group.pop('name')
+            if new_smb:
+                add_groupmap = True
         else:
             group.pop('name', None)
+            if new_smb and not old_smb:
+                add_groupmap = True
+            elif old_smb and not new_smb:
+                await self.middleware.call('smb.groupmap_delete', {"ntgroup": group['group']})
 
         group = await self.group_compress(group)
         await self.middleware.call('datastore.update', 'account.bsdgroups', pk, group, {'prefix': 'bsdgrp_'})
@@ -1010,12 +1084,13 @@ class GroupService(CRUDService):
             for i in to_add:
                 await self.middleware.call('datastore.insert', 'account.bsdgroupmembership', {'bsdgrpmember_group': pk, 'bsdgrpmember_user': i})
 
-        if delete_groupmap:
-            await self.middleware.call('smb.groupmap_delete', delete_groupmap)
-
         await self.middleware.call('service.reload', 'user')
 
-        if group['smb']:
+        """
+        "net groupmap" checks for existence of group prior to creating new groupmaps. This section
+        must occur after user reload.
+        """
+        if add_groupmap:
             await self.middleware.call('smb.groupmap_add', group['group'])
 
         return pk
@@ -1029,8 +1104,8 @@ class GroupService(CRUDService):
         """
 
         group = await self._get_instance(pk)
-        if group['smb']:
-            await self.middleware.call('smb.groupmap_delete', group['group'])
+        if group['smb'] and (g := (await self.middleware.call('smb.groupmap_list')).get(group['group'])):
+            await self.middleware.call('smb.groupmap_delete', {"sid": g['SID']})
 
         if group['builtin']:
             raise CallError('A built-in group cannot be deleted.', errno.EACCES)
@@ -1061,7 +1136,10 @@ class GroupService(CRUDService):
             # bigger than 1, it means we have a gap and can use it.
             if i['gid'] - last_gid > 1:
                 return last_gid + 1
-            last_gid = i['gid']
+
+            if i['gid'] > last_gid:
+                last_gid = i['gid']
+
         return last_gid + 1
 
     @accepts(Dict(
@@ -1081,6 +1159,29 @@ class GroupService(CRUDService):
         exclude_filter = [('id', '!=', pk)] if pk else []
 
         if 'name' in data:
+            if data.get('smb'):
+                if data['name'].upper() in [x.name for x in SMBBuiltin]:
+                    verrors.add(
+                        f'{schema}.name',
+                        f'Group name "{data["name"]}" conflicts with existing SMB Builtin entry. '
+                        f'SMB group mapping is not permitted for this group.',
+                        errno.EEXIST,
+                    )
+
+                smb_groups = await self.middleware.call('datastore.query',
+                                                        'account.bsdgroups',
+                                                        [('smb', '=', True)] + exclude_filter,
+                                                        {'prefix': 'bsdgrp_'})
+
+                if any(filter(lambda x: data['name'].casefold() == x['group'].casefold(), smb_groups)):
+                    verrors.add(
+                        f'{schema}.name',
+                        f'Group name "{data["name"]}" conflicts with existing groupmap entry. '
+                        f'SMB group mapping is not permitted for this group. Note that SMB '
+                        f'group names are case-insensitive.',
+                        errno.EEXIST,
+                    )
+
             existing = await self.middleware.call('datastore.query', 'account.bsdgroups', [('group', '=', data['name'])] + exclude_filter, {'prefix': 'bsdgrp_'})
             if existing:
                 verrors.add(

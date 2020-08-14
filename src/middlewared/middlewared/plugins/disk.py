@@ -6,21 +6,20 @@ import subprocess
 
 try:
     from bsd import geom
+    from nvme import get_nsid
 except ImportError:
     geom = None
+    get_nsid = None
 
 from middlewared.schema import accepts, Bool, Dict, Int, Str
-from middlewared.service import private, CallError, CRUDService
+from middlewared.service import filterable, private, CallError, CRUDService
 from middlewared.service_exception import ValidationErrors
 import middlewared.sqlalchemy as sa
-from middlewared.utils import osc, Popen, run
+from middlewared.utils import osc, run
 from middlewared.utils.asyncio_ import asyncio_map
 
 
-RE_CAMCONTROL_AAM = re.compile(r'^automatic acoustic management\s+yes', re.M)
-RE_CAMCONTROL_APM = re.compile(r'^advanced power management\s+yes', re.M)
 RE_CAMCONTROL_DRIVE_LOCKED = re.compile(r'^drive locked\s+yes$', re.M)
-RE_CAMCONTROL_POWER = re.compile(r'^power management\s+yes', re.M)
 RE_DA = re.compile('^da[0-9]+$')
 RE_MPATH_NAME = re.compile(r'[a-z]+(\d+)')
 RE_SED_RDLOCK_EN = re.compile(r'(RLKEna = Y|ReadLockEnabled:\s*1)', re.M)
@@ -64,8 +63,16 @@ class DiskService(CRUDService):
         datastore = 'storage.disk'
         datastore_prefix = 'disk_'
         datastore_extend = 'disk.disk_extend'
-        datastore_filters = [('expiretime', '=', None)]
         datastore_extend_context = 'disk.disk_extend_context'
+
+    @filterable
+    async def query(self, filters=None, options=None):
+        filters = filters or []
+        options = options or {}
+        if not options.get('extra', {}).get('include_expired', False):
+            filters += [('expiretime', '=', None)]
+
+        return await super().query(filters, options)
 
     @private
     async def disk_extend(self, disk, context):
@@ -296,7 +303,7 @@ class DiskService(CRUDService):
         if _advconfig is None:
             _advconfig = await self.middleware.call('system.advanced.config')
 
-        devname = f'/dev/{disk_name}'
+        devname = await self.middleware.call('disk.sed_dev_name', disk_name)
         # We need two states to tell apart when disk was successfully unlocked
         locked = None
         unlocked = None
@@ -350,7 +357,7 @@ class DiskService(CRUDService):
         if unlocked:
             try:
                 # Disk needs to be retasted after unlock
-                with open(devname, 'wb'):
+                with open(f'/dev/{disk_name}', 'wb'):
                     pass
             except OSError:
                 pass
@@ -368,7 +375,7 @@ class DiskService(CRUDService):
         SETUP_FAILED - Initial setup call failed
         SUCCESS - Setup successfully completed
         """
-        devname = f'/dev/{disk_name}'
+        devname = await self.middleware.call('disk.sed_dev_name', disk_name)
 
         cp = await run('sedutil-cli', '--isValidSED', devname, check=False)
         if b' SED ' not in cp.stdout:
@@ -397,7 +404,15 @@ class DiskService(CRUDService):
 
         return 'SUCCESS'
 
-    async def __multipath_create(self, name, consumers, mode=None):
+    def sed_dev_name(self, disk_name):
+        if disk_name.startswith("nvd"):
+            nvme = get_nsid(f"/dev/{disk_name}")
+            return f"/dev/{nvme}"
+
+        return f"/dev/{disk_name}"
+
+    @private
+    async def multipath_create(self, name, consumers, mode=None):
         """
         Create an Active/Passive GEOM_MULTIPATH provider
         with name ``name`` using ``consumers`` as the consumers for it
@@ -413,10 +428,10 @@ class DiskService(CRUDService):
         cmd = ["/sbin/gmultipath", "label", name] + consumers
         if mode:
             cmd.insert(2, f'-{mode}')
-        p1 = await Popen(cmd, stdout=subprocess.PIPE)
-        if (await p1.wait()) != 0:
-            return False
-        return True
+        try:
+            await run(cmd, stderr=subprocess.STDOUT, encoding="utf-8", errors="ignore")
+        except subprocess.CalledProcessError as e:
+            raise CallError(f"Error creating multipath: {e.stdout}")
 
     async def __multipath_next(self):
         """
@@ -509,7 +524,10 @@ class DiskService(CRUDService):
             if not len(disks) > 1:
                 continue
             name = await self.__multipath_next()
-            await self.__multipath_create(name, disks, 'A' if disks[0] in active_active else mode)
+            try:
+                await self.multipath_create(name, disks, 'A' if disks[0] in active_active else mode)
+            except CallError as e:
+                self.logger.error("Error creating multipath: %s", e.errmsg)
 
         # Scan again to take new multipaths into account
         await self.middleware.run_in_thread(geom.scan)
@@ -586,22 +604,16 @@ class DiskService(CRUDService):
         return disks_cache
 
     @private
-    async def label(self, dev, label):
-        cp = await run('geom', 'label', 'label', label, dev, check=False)
-        if cp.returncode != 0:
-            raise CallError(f'Failed to label {dev}: {cp.stderr.decode()}')
-
-    @private
     async def configure_power_management(self):
         """
         This runs on boot to properly configure all power management options
         (Advanced Power Management, Automatic Acoustic Management and IDLE) for all disks.
         """
-        # Only run power management for FreeNAS
-        if not await self.middleware.call('system.is_freenas'):
+        # Do not run power management on ENTERPRISE
+        if await self.middleware.call('system.product_type') == 'ENTERPRISE':
             return
         for disk in await self.middleware.call('disk.query'):
-            await self.power_management(disk['name'], disk=disk)
+            await self.middleware.call('disk.power_management', disk['name'], disk)
 
     @private
     async def power_management(self, dev, disk=None):
@@ -609,51 +621,14 @@ class DiskService(CRUDService):
         Actually sets power management for `dev`.
         `disk` is the disk.query entry and optional so this can be called only with disk name.
         """
+
         if not disk:
             disk = await self.middleware.call('disk.query', [('name', '=', dev)])
             if not disk:
                 return
             disk = disk[0]
 
-        try:
-            identify = (await run('camcontrol', 'identify', dev)).stdout.decode()
-        except subprocess.CalledProcessError:
-            return
-
-        # Try to set APM
-        if RE_CAMCONTROL_APM.search(identify):
-            args = ['camcontrol', 'apm', dev]
-            if disk['advpowermgmt'] != 'DISABLED':
-                args += ['-l', disk['advpowermgmt']]
-            asyncio.ensure_future(run(*args, check=False))
-
-        # Try to set AAM
-        if RE_CAMCONTROL_AAM.search(identify):
-            acousticlevel_map = {
-                'MINIMUM': '1',
-                'MEDIUM': '64',
-                'MAXIMUM': '127',
-            }
-            asyncio.ensure_future(run(
-                'camcontrol', 'aam', dev, '-l', acousticlevel_map.get(disk['acousticlevel'], '0'),
-                check=False,
-            ))
-
-        # Try to set idle
-        if RE_CAMCONTROL_POWER.search(identify):
-            if disk['hddstandby'] != 'ALWAYS ON':
-                # database is in minutes, camcontrol uses seconds
-                idle = int(disk['hddstandby']) * 60
-            else:
-                idle = 0
-
-            # We wait a minute before applying idle because its likely happening during system boot
-            # or some activity is happening very soon.
-            async def camcontrol_idle():
-                await asyncio.sleep(60)
-                asyncio.ensure_future(run('camcontrol', 'idle', dev, '-t', str(idle), check=False))
-
-            asyncio.ensure_future(camcontrol_idle())
+        return await self.middleware.call('disk.power_management_impl', dev, disk)
 
 
 async def _event_system_ready(middleware, event_type, args):

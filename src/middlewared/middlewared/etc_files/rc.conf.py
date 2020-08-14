@@ -1,6 +1,4 @@
-import contextlib
 import itertools
-import os
 import re
 import subprocess
 import sysctl
@@ -73,6 +71,9 @@ def host_config(middleware, context):
                 config['netwait_ip'] = config['ipv4gateway']
             elif config['ipv6gateway']:
                 config['netwait_ip'] = config['ipv6gateway']
+        else:
+            config['netwait_ip'] = ' '.join(config["netwait_ip"])
+
         yield f'netwait_ip="{config["netwait_ip"]}"'
 
 
@@ -152,6 +153,10 @@ def services_config(middleware, context):
 
 
 def nfs_config(middleware, context):
+    # nfs.extend() method checks contents of keytab for
+    # nfs service principal name entries. Ensure that
+    # system keytab is generated before this point.
+    middleware.call_sync('etc.generate', 'kerberos')
     nfs = middleware.call_sync('nfs.config')
 
     mountd_flags = ['-rS']
@@ -180,30 +185,13 @@ def nfs_config(middleware, context):
     Make sure the IPs exist before we try to bind the NFS service to them
     Redmine 16044
     """
-    if nfs['bindip']:
-        found = False
-        for iface in middleware.call_sync('interface.query'):
-            for alias in iface['state']['aliases']:
-                if alias['address'] in nfs['bindip']:
-                    found = True
-                    break
-            if found:
-                break
-
-        if found:
-            found = True
-            # FIXME: stop using sentinel file
-            with contextlib.suppress(Exception):
-                os.unlink(NFS_BINDIP_NOTFOUND)
-
-            ips = list(itertools.chain(*[['-h', i] for i in nfs['bindip']]))
-            mountd_flags += ips
-            nfs_server_flags += ips
-            statd_flags += ips
-            yield f'rpcbind_flags="{" ".join(ips)}"'
-        else:
-            with open(NFS_BINDIP_NOTFOUND, 'w'):
-                pass
+    bindip = middleware.call_sync('nfs.bindip', nfs)
+    if bindip:
+        ips = list(itertools.chain(*[['-h', i] for i in bindip]))
+        mountd_flags += ips
+        nfs_server_flags += ips
+        statd_flags += ips
+        yield f'rpcbind_flags="{" ".join(ips)}"'
 
     yield f'nfs_server_flags="{" ".join(nfs_server_flags)}"'
     yield f'rpc_statd_flags="{" ".join(statd_flags)}"'
@@ -222,13 +210,13 @@ def nfs_config(middleware, context):
     if nfs['v4']:
         yield 'nfsv4_server_enable="YES"'
 
-        if nfs['v4_krb'] and middleware.call_sync('datastore.query', 'directoryservice.kerberoskeytab'):
+        if nfs['v4_krb_enabled']:
             if enabled:
-                yield f'gssd_enable="YES"'
+                yield 'gssd_enable="YES"'
 
-            gc = middleware.call_sync("datastore.config", "network.globalconfiguration")
-            if gc["gc_hostname_virtual"] and gc["gc_domain"]:
-                yield f'nfs_server_vhost="{gc["gc_hostname_virtual"]}.{gc["gc_domain"]}"'
+            gc = middleware.call_sync("network.configuration.config")
+            if gc.get("hostname_virtual") and gc["domain"]:
+                yield f'nfs_server_vhost="{gc["hostname_virtual"]}.{gc["domain"]}"'
 
         if nfs['v4_v3owner']:
             # Per RFC7530, sending NFSv3 style UID/GIDs across the wire is now allowed
@@ -309,7 +297,8 @@ def powerd_config(middleware, context):
 
 def s3_config(middleware, context):
     s3 = middleware.call_sync('s3.config')
-    yield f'minio_disks="{s3["storage_path"]}"'
+    path = s3['storage_path'].replace(' ', '\\ ')
+    yield f'minio_disks="{path}"'
     yield f'minio_address="{s3["bindip"]}:{s3["bindport"]}"'
     yield 'minio_certs="/usr/local/etc/minio/certs"'
     browser = 'MINIO_BROWSER=off \\\n' if not s3['browser'] else ''
@@ -361,6 +350,10 @@ def truenas_config(middleware, context):
         yield 'failover_enable="NO"'
     else:
         yield 'failover_enable="YES"'
+
+
+def truecommand_config(middleware, context):
+    return ['wireguard_interfaces="wg0"'] if middleware.call_sync('truecommand.config')['enabled'] else []
 
 
 def tunable_config(middleware, context):
@@ -459,11 +452,12 @@ def render(service, middleware):
         snmp_config,
         staticroute_config,
         tftp_config,
+        truecommand_config,
         truenas_config,
-        tunable_config,
         vmware_config,
         watchdog_config,
         zfs_config,
+        tunable_config,
     ):
         try:
             rcs += list(i(middleware, context))

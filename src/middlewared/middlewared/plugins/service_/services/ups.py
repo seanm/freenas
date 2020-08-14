@@ -20,6 +20,8 @@ class UPSService(SimpleService):
     freebsd_pidfile = "/var/db/nut/upsmon.pid"
     freebsd_procname = "upsmon"
 
+    systemd_unit = "nut-monitor"
+
     async def before_start(self):
         await self.middleware.call("ups.dismiss_alerts")
 
@@ -29,12 +31,21 @@ class UPSService(SimpleService):
         await self._freebsd_service("nut_upsmon", "start")
         await self._freebsd_service("nut_upslog", "start")
 
+    async def _start_linux(self):
+        if (await self.middleware.call("ups.config"))["mode"] == "MASTER":
+            await self._systemd_unit("nut-server", "start")
+        await self._unit_action("Start")
+
     async def after_start(self):
         if await self.middleware.call("service.started", "collectd"):
             asyncio.ensure_future(self.middleware.call("service.restart", "collectd"))
 
     async def before_stop(self):
         await self.middleware.call("ups.dismiss_alerts")
+
+    async def _stop_linux(self):
+        await self._unit_action("Stop")
+        await self._systemd_unit("nut-server", "stop")
 
     async def _stop_freebsd(self):
         await self._freebsd_service("nut_upslog", "stop", force=True)

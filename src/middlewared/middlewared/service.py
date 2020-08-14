@@ -5,29 +5,45 @@ import asyncio
 import errno
 import inspect
 import json
-import logging
 import os
 import re
 import socket
-import sys
 import threading
 import time
 import traceback
+from subprocess import run
+import ipaddress
+
+import psutil
 
 from middlewared.common.environ import environ_update
 import middlewared.main
 from middlewared.schema import accepts, Bool, Dict, Int, List, Ref, Str
 from middlewared.service_exception import CallException, CallError, ValidationError, ValidationErrors  # noqa
-from middlewared.utils import filter_list
+from middlewared.utils import filter_list, osc
 from middlewared.utils.debug import get_frame_details, get_threads_stacks
-from middlewared.logger import Logger
+from middlewared.logger import Logger, reconfigure_logging
 from middlewared.job import Job
 from middlewared.pipe import Pipes
 from middlewared.utils.type import copy_function_metadata
-
+from middlewared.async_validators import check_path_resides_within_volume
+from middlewared.validators import Range, IpAddress
 
 PeriodicTaskDescriptor = namedtuple("PeriodicTaskDescriptor", ["interval", "run_on_start"])
 get_or_insert_lock = asyncio.Lock()
+LOCKS = defaultdict(asyncio.Lock)
+
+
+def lock(lock_str):
+    def lock_fn(fn):
+        f_lock = LOCKS[lock_str]
+
+        @wraps(fn)
+        async def l_fn(*args, **kwargs):
+            async with f_lock:
+                return await fn(*args, **kwargs)
+        return l_fn
+    return lock_fn
 
 
 def item_method(fn):
@@ -38,7 +54,8 @@ def item_method(fn):
     return fn
 
 
-def job(lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, check_pipes=True, transient=False):
+def job(lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, check_pipes=True, transient=False,
+        description=None):
     """Flag method as a long running job."""
     def check_job(fn):
         fn._job = {
@@ -49,6 +66,7 @@ def job(lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, 
             'pipes': pipes or [],
             'check_pipes': check_pipes,
             'transient': transient,
+            'description': description,
         }
         return fn
     return check_job
@@ -197,7 +215,6 @@ class ServiceBase(type):
       - datastore: name of the datastore mainly used in the service
       - datastore_extend: datastore `extend` option used in common `query` method
       - datastore_prefix: datastore `prefix` option used in helper methods
-      - datastore_filters: datastore default filters to be used in `query` method
       - service: system service `name` option used by `SystemServiceService`
       - service_model: system service datastore model option used by `SystemServiceService` (`service` if used if not provided)
       - service_verb: verb to be used on update (default to `reload`)
@@ -229,7 +246,6 @@ class ServiceBase(type):
             'datastore_prefix': '',
             'datastore_extend': None,
             'datastore_extend_context': None,
-            'datastore_filters': None,
             'service': None,
             'service_model': None,
             'service_verb': 'reload',
@@ -400,6 +416,14 @@ class CRUDService(ServiceChangeMixin, Service):
     CRUD stands for Create Retrieve Update Delete.
     """
 
+    @private
+    async def get_options(self, options):
+        options = options or {}
+        options['extend'] = self._config.datastore_extend
+        options['extend_context'] = self._config.datastore_extend_context
+        options['prefix'] = self._config.datastore_prefix
+        return options
+
     @filterable
     async def query(self, filters=None, options=None):
         if not self._config.datastore:
@@ -410,12 +434,8 @@ class CRUDService(ServiceChangeMixin, Service):
 
         if not filters:
             filters = []
-        filters += self._config.datastore_filters or []
 
-        options = options or {}
-        options['extend'] = self._config.datastore_extend
-        options['extend_context'] = self._config.datastore_extend_context
-        options['prefix'] = self._config.datastore_prefix
+        options = await self.get_options(options)
 
         # In case we are extending which may transform the result in numerous ways
         # we can only filter the final result.
@@ -458,6 +478,7 @@ class CRUDService(ServiceChangeMixin, Service):
         await self.middleware.call_hook(f'{self._config.namespace}.post_delete', rv)
         return rv
 
+    @private
     async def get_instance(self, id):
         """
         Returns instance matching `id`. If `id` is not found, Validation error is raised.
@@ -545,6 +566,107 @@ class CRUDService(ServiceChangeMixin, Service):
                             {'dependencies': list(dependencies.values())})
 
 
+class SharingTaskService(CRUDService):
+
+    path_field = 'path'
+    enabled_field = 'enabled'
+    locked_field = 'locked'
+    service_type = NotImplemented
+    locked_alert_class = NotImplemented
+    share_task_type = NotImplemented
+
+    @private
+    async def sharing_task_extend_context(self, extra):
+        return {
+            'locked_datasets': await self.middleware.call('zfs.dataset.locked_datasets'),
+            'service_extend': (await self.middleware.call(self._config.datastore_extend_context, extra))
+            if self._config.datastore_extend_context else {}
+        }
+
+    @private
+    async def validate_path_field(self, data, schema, verrors):
+        await check_path_resides_within_volume(
+            verrors, self.middleware, f'{schema}.{self.path_field}', data.get(self.path_field)
+        )
+        return verrors
+
+    @private
+    async def sharing_task_determine_locked(self, data, locked_datasets):
+        return await self.middleware.call(
+            'pool.dataset.path_in_locked_datasets', data[self.path_field], locked_datasets
+        )
+
+    @private
+    async def sharing_task_extend(self, data, context):
+        args = [data] + ([context['service_extend']] if self._config.datastore_extend_context else [])
+
+        if self._config.datastore_extend:
+            data = await self.middleware.call(self._config.datastore_extend, *args)
+
+        data[self.locked_field] = await self.middleware.call(
+            f'{self._config.namespace}.sharing_task_determine_locked', data, context['locked_datasets']
+        )
+
+        return data
+
+    @private
+    async def get_options(self, options):
+        return {
+            **(await super().get_options(options)),
+            'extend': f'{self._config.namespace}.sharing_task_extend',
+            'extend_context': f'{self._config.namespace}.sharing_task_extend_context',
+        }
+
+    @private
+    async def human_identifier(self, share_task):
+        raise NotImplementedError
+
+    @private
+    async def generate_locked_alert(self, share_task_id):
+        share_task = await self.get_instance(share_task_id)
+        await self.middleware.call(
+            'alert.oneshot_create', self.locked_alert_class,
+            {**share_task, 'identifier': await self.human_identifier(share_task), 'type': self.share_task_type}
+        )
+
+    @private
+    async def remove_locked_alert(self, share_task_id):
+        await self.middleware.call(
+            'alert.oneshot_delete', self.locked_alert_class, f'"{self.share_task_type}_{share_task_id}"'
+        )
+
+    @pass_app(rest=True)
+    async def update(self, app, id, data):
+        rv = await super().update(app, id, data)
+        if not rv[self.enabled_field] or not rv[self.locked_field]:
+            await self.remove_locked_alert(rv['id'])
+        return rv
+
+    @pass_app(rest=True)
+    async def delete(self, app, id, *args):
+        rv = await super().delete(app, id, *args)
+        await self.remove_locked_alert(id)
+        return rv
+
+
+class SharingService(SharingTaskService):
+    service_type = 'share'
+    locked_alert_class = 'ShareLocked'
+
+    @private
+    async def human_identifier(self, share_task):
+        return share_task['name']
+
+
+class TaskPathService(SharingTaskService):
+    service_type = 'task'
+    locked_alert_class = 'TaskLocked'
+
+    @private
+    async def human_identifier(self, share_task):
+        return share_task[self.path_field]
+
+
 def is_service_class(service, klass):
     return (
         isinstance(service, klass) or
@@ -578,7 +700,7 @@ class ServicePartBaseMeta(ServiceBase):
             else:
                 original_argspec = inspect.getfullargspec(original_method)
             if original_argspec != inspect.getfullargspec(new_method):
-                raise RuntimeError(f"Signature for method {name!r} does not match between {klass!r} and it's base " 
+                raise RuntimeError(f"Signature for method {name!r} does not match between {klass!r} and it's base "
                                    f"{base!r}")
 
             copy_function_metadata(original_method, new_method)
@@ -876,6 +998,81 @@ class CoreService(Service):
         """
         return 'pong'
 
+    def _ping_host(self, host, timeout):
+        if osc.IS_LINUX:
+            process = run(['ping', '-4', '-w', f'{timeout}', host])
+        else:
+            process = run(['ping', '-t', f'{timeout}', host])
+
+        return process.returncode == 0
+
+    def _ping6_host(self, host, timeout):
+        if osc.IS_LINUX:
+            process = run(['ping6', '-w', f'{timeout}', host])
+        else:
+            process = run(['ping6', '-X', f'{timeout}', host])
+
+        return process.returncode == 0
+
+    @accepts(
+        Dict(
+            'options',
+            Str('type', enum=['ICMP', 'ICMPV4', 'ICMPV6'], default='ICMP'),
+            Str('hostname', required=True),
+            Int('timeout', validators=[Range(min=1, max=60)], default=4),
+        ),
+    )
+    def ping_remote(self, options):
+        """
+        Method that will send an ICMP echo request to "hostname"
+        and will wait up to "timeout" for a reply.
+        """
+        ip = None
+        ip_found = True
+        verrors = ValidationErrors()
+        try:
+            ip = IpAddress()
+            ip(options['hostname'])
+            ip = options['hostname']
+        except ValueError:
+            ip_found = False
+        if not ip_found:
+            try:
+                if options['type'] == 'ICMP':
+                    ip = socket.getaddrinfo(options['hostname'], None)[0][4][0]
+                elif options['type'] == 'ICMPV4':
+                    ip = socket.getaddrinfo(options['hostname'], None, socket.AF_INET)[0][4][0]
+                elif options['type'] == 'ICMPV6':
+                    ip = socket.getaddrinfo(options['hostname'], None, socket.AF_INET6)[0][4][0]
+            except socket.gaierror:
+                verrors.add(
+                    'options.hostname',
+                    f'{options["hostname"]} cannot be resolved to an IP address.'
+                )
+
+        verrors.check()
+
+        addr = ipaddress.ip_address(ip)
+        if not addr.version == 4 and (options['type'] == 'ICMP' or options['type'] == 'ICMPV4'):
+            verrors.add(
+                'options.type',
+                f'Requested ICMPv4 protocol, but the address provided "{addr}" is not a valid IPv4 address.'
+            )
+        if not addr.version == 6 and options['type'] == 'ICMPV6':
+            verrors.add(
+                'options.type',
+                f'Requested ICMPv6 protocol, but the address provided "{addr}" is not a valid IPv6 address.'
+            )
+        verrors.check()
+
+        ping_host = False
+        if addr.version == 4:
+            ping_host = self._ping_host(ip, options['timeout'])
+        elif addr.version == 6:
+            ping_host = self._ping6_host(ip, options['timeout'])
+
+        return ping_host
+
     @accepts(
         Str('method'),
         List('args', default=[]),
@@ -899,17 +1096,15 @@ class CoreService(Service):
         we need to make sure the log file is reopened because
         of the new location
         """
-        handler = logging._handlers.get('file')
-        if handler:
-            stream = handler.stream
-            handler.stream = handler._open()
-            if sys.stdout is stream:
-                sys.stdout = handler.stream
-                sys.stderr = handler.stream
-            try:
-                stream.close()
-            except Exception:
-                pass
+        reconfigure_logging()
+
+        # We need to kill this because multiprocessing has passed it stderr fd which is /var/log/middlewared.log
+        if osc.IS_LINUX:
+            for process in psutil.process_iter(attrs=["cmdline"]):
+                if "from multiprocessing.resource_tracker import main" in " ".join(process.info["cmdline"]):
+                    process.kill()
+
+        self.middleware.send_event('core.reconfigure_logging', 'CHANGED')
 
     @private
     @accepts(Dict(
@@ -1026,11 +1221,11 @@ class CoreService(Service):
                 error = None
 
                 if isinstance(msg, Job):
-                    job = msg
+                    b_job = msg
                     msg = await msg.wait()
 
-                    if job.error:
-                        error = job.error
+                    if b_job.error:
+                        error = b_job.error
 
                 statuses.append({"result": msg, "error": error})
             except Exception as e:

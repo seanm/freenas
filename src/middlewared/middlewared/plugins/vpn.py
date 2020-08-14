@@ -6,8 +6,11 @@ import tempfile
 from middlewared.service import CallError, SystemServiceService, private
 from middlewared.schema import accepts, Bool, Dict, Int, IPAddr, Str, ValidationErrors
 import middlewared.sqlalchemy as sa
-from middlewared.utils import run
+from middlewared.utils import osc, run
 from middlewared.validators import Port, Range
+
+
+PROTOCOLS = ['UDP', 'UDP4', 'UDP6', 'TCP', 'TCP4', 'TCP6']
 
 
 class OpenVPN:
@@ -405,14 +408,7 @@ class OpenVPNServerService(SystemServiceService):
                 '</tls-crypt>'
             ])
 
-        return (
-            '\n'.join(
-                filter(
-                    bool,
-                    client_config
-                )
-            ) + f'\n{config["additional_parameters"]}'
-        ).strip()
+        return '\n'.join(filter(bool, client_config)).strip()
 
     @accepts(
         Dict(
@@ -428,7 +424,7 @@ class OpenVPNServerService(SystemServiceService):
             Str('cipher', null=True),
             Str('compression', null=True, enum=['LZO', 'LZ4']),
             Str('device_type', enum=['TUN', 'TAP']),
-            Str('protocol', enum=['UDP', 'TCP']),
+            Str('protocol', enum=PROTOCOLS),
             Str('tls_crypt_auth', null=True),
             Str('topology', null=True, enum=['NET30', 'P2P', 'SUBNET']),
             update=True
@@ -588,7 +584,7 @@ class OpenVPNClientService(SystemServiceService):
             Str('cipher', null=True),
             Str('compression', null=True, enum=['LZO', 'LZ4']),
             Str('device_type', enum=['TUN', 'TAP']),
-            Str('protocol', enum=['UDP', 'TCP']),
+            Str('protocol', enum=PROTOCOLS),
             Str('remote'),
             Str('tls_crypt_auth', null=True),
             update=True
@@ -614,7 +610,20 @@ class OpenVPNClientService(SystemServiceService):
         return await self.config()
 
 
+async def _event_system(middleware, event_type, args):
+
+    # TODO: Let's please make sure openvpn functions as desired in scale
+    if osc.IS_FREEBSD and args['id'] == 'ready':
+        for srv in await middleware.call(
+            'service.query', [
+                ['enable', '=', True], ['OR', [['service', '=', 'openvpn_server'], ['service', '=', 'openvpn_client']]]
+            ]
+        ):
+            await middleware.call('service.start', srv['service'])
+
+
 def setup(middleware):
+    middleware.event_subscribe('system', _event_system)
     if not os.path.exists('/usr/local/etc/rc.d/openvpn'):
         return
     for srv in ('openvpn_client', 'openvpn_server'):

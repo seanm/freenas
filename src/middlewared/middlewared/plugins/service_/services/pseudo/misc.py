@@ -4,6 +4,7 @@ from middlewared.utils import osc, run
 
 from middlewared.plugins.service_.services.base import ServiceState, ServiceInterface, SimpleService
 from middlewared.plugins.service_.services.base_freebsd import freebsd_service
+from middlewared.plugins.service_.services.base_linux import systemd_unit
 
 
 class PseudoServiceBase(ServiceInterface):
@@ -35,18 +36,22 @@ class DiskService(PseudoServiceBase):
         if osc.IS_FREEBSD:
             await freebsd_service("mountlate", "start")
 
+        # FIXME: Linux
+
         asyncio.ensure_future(self.middleware.call("service.restart", "collectd"))
 
 
 class FailoverService(PseudoServiceBase):
     name = "failover"
 
-    etc = ["failover"]
     restartable = True
 
     async def restart(self):
         if osc.IS_FREEBSD:
+            await self.middleware.call('etc.generate', 'pf')
             await freebsd_service("devd", "restart")
+
+        # FIXME: Linux
 
 
 class KmipService(PseudoServiceBase):
@@ -83,10 +88,11 @@ class HostnameService(PseudoServiceBase):
     reloadable = True
 
     async def reload(self):
-        await run(["hostname", ""])
-        await self.middleware.call("etc.generate", "hostname")
-        await self.middleware.call("etc.generate", "rc")
         if osc.IS_FREEBSD:
+            await run(["hostname", ""])
+        await self.middleware.call("etc.generate", "hostname")
+        if osc.IS_FREEBSD:
+            await self.middleware.call("etc.generate", "rc")
             await freebsd_service("hostname", "start")
         await self.middleware.call("service.restart", "mdns")
         await self.middleware.call("service.restart", "collectd")
@@ -103,11 +109,15 @@ class HttpService(PseudoServiceBase):
         await self.middleware.call("service.reload", "mdns")
         if osc.IS_FREEBSD:
             await freebsd_service("nginx", "restart")
+        if osc.IS_LINUX:
+            await systemd_unit("nginx", "restart")
 
     async def reload(self):
         await self.middleware.call("service.reload", "mdns")
         if osc.IS_FREEBSD:
             await freebsd_service("nginx", "reload")
+        if osc.IS_LINUX:
+            await systemd_unit("nginx", "reload")
 
 
 class NetworkService(PseudoServiceBase):
@@ -125,8 +135,7 @@ class NetworkGeneralService(PseudoServiceBase):
 
     async def reload(self):
         await self.middleware.call("service.reload", "resolvconf")
-        if osc.IS_FREEBSD:
-            await freebsd_service("routing", "restart")
+        await self.middleware.call("service.restart", "routing")
 
 
 class NtpdService(SimpleService):
@@ -137,6 +146,8 @@ class NtpdService(SimpleService):
 
     freebsd_rc = "ntpd"
 
+    systemd_unit = "ntp"
+
 
 class PowerdService(SimpleService):
     name = "powerd"
@@ -144,6 +155,8 @@ class PowerdService(SimpleService):
     etc = ["rc"]
 
     freebsd_rc = "powerd"
+
+    # FIXME: Linux
 
 
 class RcService(PseudoServiceBase):
@@ -171,7 +184,15 @@ class RoutingService(SimpleService):
 
     etc = ["rc"]
 
+    restartable = True
+
     freebsd_rc = "routing"
+
+    async def get_state(self):
+        return ServiceState(True, [])
+
+    async def _restart_linux(self):
+        await self.middleware.call("staticroute.sync")
 
 
 class SslService(PseudoServiceBase):
@@ -186,10 +207,16 @@ class SslService(PseudoServiceBase):
 class SysconsService(SimpleService):
     name = "syscons"
 
-    etc = ["rc"]
+    etc = ["rc"] if osc.IS_FREEBSD else ["keyboard"]
     restartable = True
 
     freebsd_rc = "syscons"
+
+    async def get_state(self):
+        return ServiceState(True, [])
+
+    async def _restart_linux(self):
+        await run(["setupcon"], check=False)
 
 
 class SysctlService(PseudoServiceBase):
@@ -210,6 +237,8 @@ class SyslogdService(SimpleService):
     reloadable = True
 
     freebsd_rc = "syslog-ng"
+
+    systemd_unit = "syslog-ng"
 
 
 class SystemService(PseudoServiceBase):
@@ -234,6 +263,8 @@ class SystemDatasetsService(PseudoServiceBase):
         if not systemdataset:
             return None
 
+        if osc.IS_LINUX:
+            await self.middleware.call("etc.generate", "docker")
         if systemdataset["syslog"]:
             await self.middleware.call("service.restart", "syslogd")
 
@@ -275,4 +306,4 @@ class UserService(PseudoServiceBase):
     reloadable = True
 
     async def reload(self):
-        await self.middleware.call("service.reload", "cifs")
+        pass

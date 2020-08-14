@@ -12,12 +12,44 @@ import pwd
 import select
 import shutil
 import subprocess
+import stat as pystat
 
 from middlewared.main import EventSource
 from middlewared.schema import Bool, Dict, Int, Ref, List, Str, UnixPerm, accepts
 from middlewared.service import private, CallError, Service, job
-from middlewared.utils import filter_list
+from middlewared.utils import filter_list, osc
 from middlewared.plugins.smb import SMBBuiltin
+
+OS_TYPE_FREEBSD = 0x01
+OS_TYPE_LINUX = 0x02
+OS_FLAG = int(osc.IS_FREEBSD) + (int(osc.IS_LINUX) << 1)
+
+
+class ACLType(enum.Enum):
+    NFS4 = (OS_TYPE_FREEBSD, ['tag', 'id', 'perms', 'flags', 'type'])
+    POSIX1E = (OS_TYPE_FREEBSD | OS_TYPE_LINUX, ['default', 'tag', 'id', 'perms'])
+    RICH = (OS_TYPE_LINUX,)
+    SAMBA = (OS_TYPE_LINUX,)
+
+    def validate(self, theacl):
+        errors = []
+        ace_keys = self.value[1]
+        if not self.value[0] & OS_FLAG:
+            errors.append("The host operating system does not support"
+                          f"ACLType [{self.name}]")
+
+        if self != ACLType.NFS4 and theacl.get('nfs41flags'):
+            errors.append(f"NFS41 ACL flags are not valid for ACLType [{self.name}]")
+
+        for idx, entry in enumerate(theacl['dacl']):
+            extra = set(entry.keys()) - set(ace_keys)
+            missing = set(ace_keys) - set(entry.keys())
+            if extra:
+                errors.append(f"ACL entry [{idx}] contains invalid extra key(s): {extra}")
+            if missing:
+                errors.append(f"ACL entry [{idx}] is missing required keys(s): {missing}")
+
+        return {"is_valid": len(errors) == 0, "errors": errors}
 
 
 class ACLDefault(enum.Enum):
@@ -200,7 +232,7 @@ class FilesystemService(Service):
         except KeyError:
             stat['group'] = None
 
-        stat['acl'] = False if self.middleware.call_sync('filesystem.acl_is_trivial', path) else True
+        stat['acl'] = False if self.acl_is_trivial(path) else True
 
         return stat
 
@@ -383,18 +415,16 @@ class FilesystemService(Service):
         return flagset
 
     def _winacl(self, path, action, uid, gid, options):
-        chroot_dir = os.path.dirname(path)
-        target = os.path.basename(path)
         winacl = subprocess.run([
             '/usr/local/bin/winacl',
             '-a', action,
             '-O', str(uid), '-G', str(gid),
             '-rx' if options['traverse'] else '-r',
-            '-c', chroot_dir,
-            '-p', target], check=False, capture_output=True
+            '-c', path,
+            '-p', path], check=False, capture_output=True
         )
         if winacl.returncode != 0:
-            CallError(f"Winacl {action} on path {path} failed with error: [{winacl.stderr.decode().strip()}]")
+            raise CallError(f"Winacl {action} on path {path} failed with error: [{winacl.stderr.decode().strip()}]")
 
     def _common_perm_path_validate(self, path):
         if not os.path.exists(path):
@@ -417,10 +447,13 @@ class FilesystemService(Service):
         a path on a tmpfs filesystem).
         """
         if not os.path.exists(path):
-            raise CallError('Path not found.', errno.ENOENT)
+            raise CallError(f'Path not found [{path}].', errno.ENOENT)
 
-        has_nfs4_acl_support = os.pathconf(path, 64)
-        if not has_nfs4_acl_support:
+        if osc.IS_LINUX:
+            posix1e_acl = self.getacl_posix1e(path, True)
+            return True if len(posix1e_acl['acl']) == 3 else False
+
+        if not os.pathconf(path, 64):
             return True
 
         return acl.ACL(file=path).is_trivial
@@ -651,15 +684,121 @@ class FilesystemService(Service):
         final_acl = non_inherited_aces + inherited_aces
         return final_acl
 
+    @private
+    def getacl_posix1e(self, path, simplified):
+        st = os.stat(path)
+        ret = {
+            'uid': st.st_uid,
+            'gid': st.st_gid,
+            'acl': [],
+            'flags': {
+                'setuid': bool(st.st_mode & pystat.S_ISUID),
+                'setgid': bool(st.st_mode & pystat.S_ISGID),
+                'sticky': bool(st.st_mode & pystat.S_ISVTX),
+            },
+            'acltype': ACLType.POSIX1E.name
+        }
+
+        ret['uid'] = st.st_uid
+        ret['gid'] = st.st_gid
+
+        gfacl = subprocess.run(['getfacl', '-c' if osc.IS_LINUX else '-q', '-n', path],
+                               check=False, capture_output=True)
+        if gfacl.returncode != 0:
+            raise CallError(f"Failed to get POSIX1e ACL on path [{path}]: {gfacl.stderr.decode()}")
+
+        # linux output adds extra line to output if it's an absolute path and extra newline at end.
+        entries = gfacl.stdout.decode().splitlines()
+        if osc.IS_LINUX:
+            entries = entries[:-1]
+
+        for entry in entries:
+            if entry.startswith("#"):
+                continue
+            ace = {
+                "default": False,
+                "tag": None,
+                "id": -1,
+                "perms": {
+                    "READ": False,
+                    "WRITE": False,
+                    "EXECUTE": False,
+                }
+            }
+
+            tag, id, perms = entry.rsplit(":", 2)
+            ace['perms'].update({
+                "READ": perms[0].casefold() == "r",
+                "WRITE": perms[1].casefold() == "w",
+                "EXECUTE": perms[2].casefold() == "x",
+            })
+            if tag.startswith('default'):
+                ace['default'] = True
+                tag = tag[8:]
+
+            ace['tag'] = tag.upper()
+            if id.isdigit():
+                ace['id'] = int(id)
+            ret['acl'].append(ace)
+
+        return ret
+
+    @private
+    def getacl_nfs4(self, path, simplified):
+        stat = os.stat(path)
+
+        a = acl.ACL(file=path)
+        fs_acl = a.__getstate__()
+
+        if not simplified:
+            advanced_acl = []
+            for entry in fs_acl:
+                ace = {
+                    'tag': (acl.ACLWho[entry['tag']]).value,
+                    'id': entry['id'],
+                    'type': entry['type'],
+                    'perms': entry['perms'],
+                    'flags': entry['flags'],
+                }
+                if ace['tag'] == 'everyone@' and self.__convert_to_basic_permset(ace['perms']) == 'NOPERMS':
+                    continue
+
+                advanced_acl.append(ace)
+
+            return {'uid': stat.st_uid, 'gid': stat.st_gid, 'acl': advanced_acl, 'acltype': ACLType.NFS4.name}
+
+        simple_acl = []
+        for entry in fs_acl:
+            ace = {
+                'tag': (acl.ACLWho[entry['tag']]).value,
+                'id': entry['id'],
+                'type': entry['type'],
+                'perms': {'BASIC': self.__convert_to_basic_permset(entry['perms'])},
+                'flags': {'BASIC': self.__convert_to_basic_flagset(entry['flags'])},
+            }
+            if ace['tag'] == 'everyone@' and ace['perms']['BASIC'] == 'NOPERMS':
+                continue
+
+            for key in ['perms', 'flags']:
+                if ace[key]['BASIC'] == 'OTHER':
+                    ace[key] = entry[key]
+
+            simple_acl.append(ace)
+
+        return {'uid': stat.st_uid, 'gid': stat.st_gid, 'acl': simple_acl, 'acltype': ACLType.NFS4.name}
+
     @accepts(
         Str('path'),
         Bool('simplified', default=True),
     )
     def getacl(self, path, simplified=True):
         """
-        Return ACL of a given path.
+        Return ACL of a given path. This may return a POSIX1e ACL or a NFSv4 ACL. The acl type is indicated
+        by the `ACLType` key.
 
-        Simplified returns a shortened form of the ACL permset and flags
+        Errata about ACLType NFSv4:
+
+        `simplified` returns a shortened form of the ACL permset and flags.
 
         `TRAVERSE` sufficient rights to traverse a directory, but not read contents.
 
@@ -683,136 +822,75 @@ class FilesystemService(Service):
         if not os.path.exists(path):
             raise CallError('Path not found.', errno.ENOENT)
 
-        stat = os.stat(path)
+        if osc.IS_LINUX or not os.pathconf(path, 64):
+            return self.getacl_posix1e(path, simplified)
 
-        a = acl.ACL(file=path)
-        fs_acl = a.__getstate__()
+        return self.getacl_nfs4(path, simplified)
 
-        if not simplified:
-            advanced_acl = []
-            for entry in fs_acl:
-                ace = {
-                    'tag': (acl.ACLWho[entry['tag']]).value,
-                    'id': entry['id'],
-                    'type': entry['type'],
-                    'perms': entry['perms'],
-                    'flags': entry['flags'],
-                }
-                if ace['tag'] == 'everyone@' and self.__convert_to_basic_permset(ace['perms']) == 'NOPERMS':
-                    continue
+    @private
+    def setacl_posix1e(self, job, data):
+        job.set_progress(0, 'Preparing to set acl.')
+        if osc.IS_FREEBSD:
+            raise CallError("POSIX1e brand ACLs not supported on the FreeBSD-based TrueNAS platform",
+                            errno.EOPNOTSUPP)
 
-                advanced_acl.append(ace)
+        options = data['options']
+        recursive = options.get('recursive')
+        dacl = data.get('dacl', [])
+        path = data['path']
 
-            return {'uid': stat.st_uid, 'gid': stat.st_gid, 'acl': advanced_acl}
+        aclcheck = ACLType.POSIX1E.validate(data)
 
-        if simplified:
-            simple_acl = []
-            for entry in fs_acl:
-                ace = {
-                    'tag': (acl.ACLWho[entry['tag']]).value,
-                    'id': entry['id'],
-                    'type': entry['type'],
-                    'perms': {'BASIC': self.__convert_to_basic_permset(entry['perms'])},
-                    'flags': {'BASIC': self.__convert_to_basic_flagset(entry['flags'])},
-                }
-                if ace['tag'] == 'everyone@' and ace['perms']['BASIC'] == 'NOPERMS':
-                    continue
+        if not aclcheck['is_valid']:
+            raise CallError(f"POSIX1e ACL is invalid: {' '.join(aclcheck['errors'])}")
 
-                for key in ['perms', 'flags']:
-                    if ace[key]['BASIC'] == 'OTHER':
-                        ace[key] = entry[key]
+        stripacl = subprocess.run(['setfacl', '-bR' if recursive else '-b', path],
+                                  check=False, capture_output=True)
+        if stripacl.returncode != 0:
+            raise CallError(f"Failed to remove POSIX1e ACL from [{path}]: "
+                            f"{stripacl.stderr.decode()}")
 
-                simple_acl.append(ace)
+        if options['stripacl']:
+            job.set_progress(100, "Finished removing POSIX1e ACL")
+            return
 
-            return {'uid': stat.st_uid, 'gid': stat.st_gid, 'acl': simple_acl}
+        job.set_progress(50, 'Reticulating splines.')
 
-    @accepts(
-        Dict(
-            'filesystem_acl',
-            Str('path', required=True),
-            Int('uid', null=True, default=None),
-            Int('gid', null=True, default=None),
-            List(
-                'dacl',
-                items=[
-                    Dict(
-                        'aclentry',
-                        Str('tag', enum=['owner@', 'group@', 'everyone@', 'USER', 'GROUP']),
-                        Int('id', null=True),
-                        Str('type', enum=['ALLOW', 'DENY']),
-                        Dict(
-                            'perms',
-                            Bool('READ_DATA'),
-                            Bool('WRITE_DATA'),
-                            Bool('APPEND_DATA'),
-                            Bool('READ_NAMED_ATTRS'),
-                            Bool('WRITE_NAMED_ATTRS'),
-                            Bool('EXECUTE'),
-                            Bool('DELETE_CHILD'),
-                            Bool('READ_ATTRIBUTES'),
-                            Bool('WRITE_ATTRIBUTES'),
-                            Bool('DELETE'),
-                            Bool('READ_ACL'),
-                            Bool('WRITE_ACL'),
-                            Bool('WRITE_OWNER'),
-                            Bool('SYNCHRONIZE'),
-                            Str('BASIC', enum=['FULL_CONTROL', 'MODIFY', 'READ', 'TRAVERSE']),
-                        ),
-                        Dict(
-                            'flags',
-                            Bool('FILE_INHERIT'),
-                            Bool('DIRECTORY_INHERIT'),
-                            Bool('NO_PROPAGATE_INHERIT'),
-                            Bool('INHERIT_ONLY'),
-                            Bool('INHERITED'),
-                            Str('BASIC', enum=['INHERIT', 'NOINHERIT']),
-                        ),
-                    )
-                ],
-                default=[]
-            ),
-            Dict(
-                'options',
-                Bool('stripacl', default=False),
-                Bool('recursive', default=False),
-                Bool('traverse', default=False),
-                Bool('canonicalize', default=True)
-            )
-        )
-    )
-    @job(lock="perm_change")
-    def setacl(self, job, data):
-        """
-        Set ACL of a given path. Takes the following parameters:
-        `path` full path to directory or file.
+        for idx, ace in enumerate(dacl):
+            if idx == 0:
+                aclstring = ""
+            else:
+                aclstring += ","
 
-        `dacl` "simplified" ACL here or a full ACL.
+            if ace['id'] == -1:
+                ace['id'] = ''
 
-        `uid` the desired UID of the file user. If set to None (the default), then user is not changed.
+            ace['tag'] = ace['tag'].rstrip('_OBJ').lower()
 
-        `gid` the desired GID of the file group. If set to None (the default), then group is not changed.
+            if ace['default']:
+                aclstring += "default:"
 
-        `recursive` apply the ACL recursively
+            aclstring += f"{ace['tag']}:{ace['id']}:"
+            aclstring += 'r' if ace['perms']['READ'] else '-'
+            aclstring += 'w' if ace['perms']['WRITE'] else '-'
+            aclstring += 'x' if ace['perms']['EXECUTE'] else '-'
 
-        `traverse` traverse filestem boundaries (ZFS datasets)
+        setacl = subprocess.run(['setfacl', '-mR' if recursive else '-m', aclstring, path],
+                                check=False, capture_output=True)
+        if setacl.returncode != 0:
+            return CallError(f'Failed to set ACL on path [{path}]: ',
+                             f'{setacl.stderr.decode()}')
 
-        `strip` convert ACL to trivial. ACL is trivial if it can be expressed as a file mode without
-        losing any access rules.
+        job.set_progress(100, 'Finished setting POSIX1e ACL.')
 
-        `canonicalize` reorder ACL entries so that they are in concanical form as described
-        in the Microsoft documentation MS-DTYP 2.4.5 (ACL)
-
-        In all cases we replace USER_OBJ, GROUP_OBJ, and EVERYONE with owner@, group@, everyone@ for
-        consistency with getfacl and setfacl. If one of aforementioned special tags is used, 'id' must
-        be set to None.
-
-        An inheriting empty everyone@ ACE is appended to non-trivial ACLs in order to enforce Windows
-        expectations regarding permissions inheritance. This entry is removed from NT ACL returned
-        to SMB clients when 'ixnas' samba VFS module is enabled.
-        """
+    @private
+    def setacl_nfs4(self, job, data):
         job.set_progress(0, 'Preparing to set acl.')
         options = data['options']
         dacl = data.get('dacl', [])
+
+        if osc.IS_LINUX or not os.pathconf(data['path'], 64):
+            raise CallError(f"NFSv4 ACLS are not supported on path {data['path']}", errno.EOPNOTSUPP)
 
         self._common_perm_path_validate(data['path'])
 
@@ -871,12 +949,120 @@ class FilesystemService(Service):
 
         if not options['recursive']:
             os.chown(data['path'], uid, gid)
-            job.set_progress(100, 'Finished setting ACL.')
+            job.set_progress(100, 'Finished setting NFS4 ACL.')
             return
 
         job.set_progress(10, f'Recursively setting ACL on {data["path"]}.')
         self._winacl(data['path'], 'clone', uid, gid, options)
-        job.set_progress(100, 'Finished setting ACL.')
+        job.set_progress(100, 'Finished setting NFS4 ACL.')
+
+    @accepts(
+        Dict(
+            'filesystem_acl',
+            Str('path', required=True),
+            Int('uid', null=True, default=None),
+            Int('gid', null=True, default=None),
+            List(
+                'dacl',
+                items=[
+                    Dict(
+                        'aclentry',
+                        Str('tag', enum=['owner@', 'group@', 'everyone@', 'USER', 'GROUP']),
+                        Int('id', null=True),
+                        Str('type', enum=['ALLOW', 'DENY']),
+                        Dict(
+                            'perms',
+                            Bool('READ_DATA'),
+                            Bool('WRITE_DATA'),
+                            Bool('APPEND_DATA'),
+                            Bool('READ_NAMED_ATTRS'),
+                            Bool('WRITE_NAMED_ATTRS'),
+                            Bool('EXECUTE'),
+                            Bool('DELETE_CHILD'),
+                            Bool('READ_ATTRIBUTES'),
+                            Bool('WRITE_ATTRIBUTES'),
+                            Bool('DELETE'),
+                            Bool('READ_ACL'),
+                            Bool('WRITE_ACL'),
+                            Bool('WRITE_OWNER'),
+                            Bool('SYNCHRONIZE'),
+                            Str('BASIC', enum=['FULL_CONTROL', 'MODIFY', 'READ', 'TRAVERSE']),
+                        ),
+                        Dict(
+                            'flags',
+                            Bool('FILE_INHERIT'),
+                            Bool('DIRECTORY_INHERIT'),
+                            Bool('NO_PROPAGATE_INHERIT'),
+                            Bool('INHERIT_ONLY'),
+                            Bool('INHERITED'),
+                            Str('BASIC', enum=['INHERIT', 'NOINHERIT']),
+                        ),
+                    ),
+                    Dict(
+                        'posix1e_ace',
+                        Bool('default', default=False),
+                        Str('tag', enum=['USER_OBJ', 'GROUP_OBJ', 'USER', 'GROUP', 'OTHER', 'MASK']),
+                        Int('id', default=-1),
+                        Dict(
+                            'perms',
+                            Bool('READ', default=False),
+                            Bool('WRITE', default=False),
+                            Bool('EXECUTE', default=False),
+                        ),
+                    )
+                ],
+                default=[]
+            ),
+            Dict(
+                'nfs41_flags',
+                Bool('autoinherit', default=False),
+                Bool('protected', default=False),
+            ),
+            Str('acltype', enum=[x.name for x in ACLType], default=ACLType.NFS4.name),
+            Dict(
+                'options',
+                Bool('stripacl', default=False),
+                Bool('recursive', default=False),
+                Bool('traverse', default=False),
+                Bool('canonicalize', default=True)
+            )
+        )
+    )
+    @job(lock="perm_change")
+    def setacl(self, job, data):
+        """
+        Set ACL of a given path. Takes the following parameters:
+        `path` full path to directory or file.
+
+        `dacl` "simplified" ACL here or a full ACL.
+
+        `uid` the desired UID of the file user. If set to None (the default), then user is not changed.
+
+        `gid` the desired GID of the file group. If set to None (the default), then group is not changed.
+
+        `recursive` apply the ACL recursively
+
+        `traverse` traverse filestem boundaries (ZFS datasets)
+
+        `strip` convert ACL to trivial. ACL is trivial if it can be expressed as a file mode without
+        losing any access rules.
+
+        `canonicalize` reorder ACL entries so that they are in concanical form as described
+        in the Microsoft documentation MS-DTYP 2.4.5 (ACL)
+
+        In all cases we replace USER_OBJ, GROUP_OBJ, and EVERYONE with owner@, group@, everyone@ for
+        consistency with getfacl and setfacl. If one of aforementioned special tags is used, 'id' must
+        be set to None.
+
+        An inheriting empty everyone@ ACE is appended to non-trivial ACLs in order to enforce Windows
+        expectations regarding permissions inheritance. This entry is removed from NT ACL returned
+        to SMB clients when 'ixnas' samba VFS module is enabled.
+        """
+        acltype = ACLType[data['acltype']]
+        if acltype == ACLType.NFS4:
+            return self.setacl_nfs4(job, data)
+        else:
+            return self.setacl_posix1e(job, data)
 
 
 class FileFollowTailEventSource(EventSource):
